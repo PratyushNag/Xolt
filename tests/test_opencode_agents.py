@@ -68,7 +68,9 @@ async def test_remove_agent_file_paths() -> None:
 @pytest.mark.asyncio
 async def test_list_deployed_agents_paths() -> None:
     sandbox = MagicMock()
-    sandbox.process.exec = AsyncMock(return_value=SimpleNamespace(exit_code=0, result="reviewer\nresearcher"))
+    sandbox.process.exec = AsyncMock(
+        return_value=SimpleNamespace(exit_code=0, result="reviewer\nresearcher")
+    )
     assert await list_deployed_agents(sandbox) == ["reviewer", "researcher"]
 
     sandbox.process.exec = AsyncMock(return_value=SimpleNamespace(exit_code=0, result=""))

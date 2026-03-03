@@ -181,11 +181,14 @@ async def test_file_methods_wrap_errors_and_bad_shapes() -> None:
         await client.list_files()
 
     client._request = AsyncMock(side_effect=SessionError("boom"))
-    with pytest.raises(FileError, match="Failed to read file README.md"):
+    with pytest.raises(FileError, match=r"Failed to read file README\.md"):
         await client.read_file("README.md")
 
     client._request = AsyncMock(return_value=[])
-    with pytest.raises(FileError, match="Unexpected response when reading file README.md"):
+    with pytest.raises(
+        FileError,
+        match=r"Unexpected response when reading file README\.md",
+    ):
         await client.read_file("README.md")
 
     client._request = AsyncMock(side_effect=SessionError("boom"))

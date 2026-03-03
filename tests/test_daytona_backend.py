@@ -50,7 +50,10 @@ async def test_create_and_attach_success(monkeypatch: pytest.MonkeyPatch) -> Non
     with (
         patch("xolt.backends.daytona.AsyncDaytona", return_value=client),
         patch("xolt.backends.daytona.Image") as image,
-        patch("xolt.backends.daytona.CreateSandboxFromImageParams", side_effect=lambda **kwargs: kwargs),
+        patch(
+            "xolt.backends.daytona.CreateSandboxFromImageParams",
+            side_effect=lambda **kwargs: kwargs,
+        ),
     ):
         image.base.return_value = "image"
         backend = DaytonaBackend(image="custom-image", create_timeout=12)
@@ -74,7 +77,10 @@ async def test_create_and_attach_wrap_failures(monkeypatch: pytest.MonkeyPatch) 
     with (
         patch("xolt.backends.daytona.AsyncDaytona", return_value=client),
         patch("xolt.backends.daytona.Image") as image,
-        patch("xolt.backends.daytona.CreateSandboxFromImageParams", side_effect=lambda **kwargs: kwargs),
+        patch(
+            "xolt.backends.daytona.CreateSandboxFromImageParams",
+            side_effect=lambda **kwargs: kwargs,
+        ),
     ):
         image.base.return_value = "image"
         backend = DaytonaBackend()

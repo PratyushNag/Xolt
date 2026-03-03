@@ -40,7 +40,9 @@ async def test_install_skills_skips_blanks_and_wraps_errors() -> None:
 @pytest.mark.asyncio
 async def test_list_skills_paths() -> None:
     sandbox = MagicMock()
-    sandbox.process.exec = AsyncMock(return_value=SimpleNamespace(exit_code=0, result="browser-use\nremote-browser"))
+    sandbox.process.exec = AsyncMock(
+        return_value=SimpleNamespace(exit_code=0, result="browser-use\nremote-browser")
+    )
     assert await list_skills(sandbox) == ["browser-use", "remote-browser"]
 
     sandbox.process.exec = AsyncMock(return_value=SimpleNamespace(exit_code=1, result=""))
