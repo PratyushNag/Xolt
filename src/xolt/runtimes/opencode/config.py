@@ -55,9 +55,7 @@ def get_proxy_script() -> str:
 def get_manage_skills_markdown() -> str:
     """Return the bundled skill management skill definition."""
 
-    return load_resource_text("manage_skills.md").format(
-        reload_flag_path=RELOAD_FLAG_PATH
-    )
+    return load_resource_text("manage_skills.md").format(reload_flag_path=RELOAD_FLAG_PATH)
 
 
 def get_skill_finder_agent() -> AgentConfig:

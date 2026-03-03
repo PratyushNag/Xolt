@@ -4,7 +4,7 @@
 
 ```bash
 uv sync --group dev
-uv run pre-commit install
+uv run pre-commit install --hook-type pre-commit --hook-type pre-push
 ```
 
 ## Required checks

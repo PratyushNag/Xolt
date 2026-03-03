@@ -49,14 +49,17 @@ async def test_preview_url_and_close_delegate(runtime_handle, backend_handle) ->
 
 @pytest.mark.asyncio
 async def test_add_skills_updates_tracked_state(runtime_handle) -> None:
-    with patch(
-        "xolt.runtimes.opencode.runtime.install_skills",
-        new_callable=AsyncMock,
-        return_value=(["a/b"], []),
-    ), patch(
-        "xolt.runtimes.opencode.runtime.dispose_all_instances",
-        new_callable=AsyncMock,
-    ) as dispose:
+    with (
+        patch(
+            "xolt.runtimes.opencode.runtime.install_skills",
+            new_callable=AsyncMock,
+            return_value=(["a/b"], []),
+        ),
+        patch(
+            "xolt.runtimes.opencode.runtime.dispose_all_instances",
+            new_callable=AsyncMock,
+        ) as dispose,
+    ):
         installed, failed = await runtime_handle.add_skills(["a/b"])
     assert installed == ["a/b"]
     assert failed == []
@@ -66,22 +69,28 @@ async def test_add_skills_updates_tracked_state(runtime_handle) -> None:
 
 @pytest.mark.asyncio
 async def test_agent_management_updates_tracked_state(runtime_handle) -> None:
-    with patch(
-        "xolt.runtimes.opencode.runtime.deploy_agent",
-        new_callable=AsyncMock,
-    ), patch(
-        "xolt.runtimes.opencode.runtime.dispose_all_instances",
-        new_callable=AsyncMock,
+    with (
+        patch(
+            "xolt.runtimes.opencode.runtime.deploy_agent",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "xolt.runtimes.opencode.runtime.dispose_all_instances",
+            new_callable=AsyncMock,
+        ),
     ):
         await runtime_handle.add_agent("reviewer", {"description": "Code reviewer"})
     assert runtime_handle.deployed_agents == ["reviewer"]
 
-    with patch(
-        "xolt.runtimes.opencode.runtime.remove_agent_file",
-        new_callable=AsyncMock,
-    ), patch(
-        "xolt.runtimes.opencode.runtime.dispose_all_instances",
-        new_callable=AsyncMock,
+    with (
+        patch(
+            "xolt.runtimes.opencode.runtime.remove_agent_file",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "xolt.runtimes.opencode.runtime.dispose_all_instances",
+            new_callable=AsyncMock,
+        ),
     ):
         await runtime_handle.remove_agent("reviewer")
     assert runtime_handle.deployed_agents == []
@@ -154,9 +163,10 @@ async def test_get_session_diff_requires_session_id(runtime_handle) -> None:
 
 
 def test_extract_and_classify_helpers() -> None:
-    assert OpenCodeRuntimeHandle.extract_text(
-        {"parts": [{"type": "text", "text": "hello"}]}
-    ) == "hello"
+    assert (
+        OpenCodeRuntimeHandle.extract_text({"parts": [{"type": "text", "text": "hello"}]})
+        == "hello"
+    )
     assert OpenCodeRuntimeHandle.extract_response([]) == "(no response)"
     assert OpenCodeRuntimeHandle.classify_file_event(
         {"type": "session.status", "properties": {"status": "idle"}}
@@ -166,24 +176,29 @@ def test_extract_and_classify_helpers() -> None:
 @pytest.mark.asyncio
 async def test_runtime_start_bootstraps_sandbox(mock_sandbox, backend_handle) -> None:
     runtime = OpenCodeRuntime(skills=["a/b"])
-    with patch(
-        "xolt.runtimes.opencode.runtime.install_skills",
-        new_callable=AsyncMock,
-        return_value=(["a/b"], []),
-    ), patch(
-        "xolt.runtimes.opencode.runtime.build_opencode_config",
-        new_callable=AsyncMock,
-        return_value=("ENV=1", "{}"),
-    ), patch(
-        "xolt.runtimes.opencode.runtime.get_proxy_script",
-        return_value="// proxy",
-    ), patch.dict(
-        sys.modules,
-        {
-            "daytona": SimpleNamespace(
-                SessionExecuteRequest=lambda **kwargs: SimpleNamespace(**kwargs)
-            )
-        },
+    with (
+        patch(
+            "xolt.runtimes.opencode.runtime.install_skills",
+            new_callable=AsyncMock,
+            return_value=(["a/b"], []),
+        ),
+        patch(
+            "xolt.runtimes.opencode.runtime.build_opencode_config",
+            new_callable=AsyncMock,
+            return_value=("ENV=1", "{}"),
+        ),
+        patch(
+            "xolt.runtimes.opencode.runtime.get_proxy_script",
+            return_value="// proxy",
+        ),
+        patch.dict(
+            sys.modules,
+            {
+                "daytona": SimpleNamespace(
+                    SessionExecuteRequest=lambda **kwargs: SimpleNamespace(**kwargs)
+                )
+            },
+        ),
     ):
         handle = await runtime.start(backend_handle)
     assert handle.session_id.startswith("xolt-runtime-")

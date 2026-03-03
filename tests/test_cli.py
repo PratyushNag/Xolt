@@ -41,10 +41,14 @@ async def test_start_writes_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
         close=AsyncMock(),
     )
 
-    with patch("xolt.cli.build_backend", return_value=object()), patch(
-        "xolt.cli.build_runtime",
-        return_value=object(),
-    ), patch("xolt.cli.XoltSession.create", new_callable=AsyncMock, return_value=session):
+    with (
+        patch("xolt.cli.build_backend", return_value=object()),
+        patch(
+            "xolt.cli.build_runtime",
+            return_value=object(),
+        ),
+        patch("xolt.cli.XoltSession.create", new_callable=AsyncMock, return_value=session),
+    ):
         await create_session(args)
 
     state = load_state()

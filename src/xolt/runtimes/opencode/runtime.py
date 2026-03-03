@@ -364,8 +364,10 @@ class OpenCodeRuntimeHandle:
     @staticmethod
     def _is_raw_fallback(text: str) -> bool:
         stripped = text.lstrip()
-        return not text or text == "(no response)" or (
-            stripped.startswith("{") and "'info'" in stripped
+        return (
+            not text
+            or text == "(no response)"
+            or (stripped.startswith("{") and "'info'" in stripped)
         )
 
     @staticmethod

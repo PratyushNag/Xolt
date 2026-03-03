@@ -25,6 +25,20 @@ repos:
         pass_filenames: true
         types_or: [python, pyi]
 
+      - id: ruff-check-all
+        name: ruff check (full tree)
+        entry: uv run ruff check .
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: ruff-format-check
+        name: ruff format check
+        entry: uv run ruff format --check .
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+
       - id: mypy
         name: mypy
         entry: uv run mypy src/xolt

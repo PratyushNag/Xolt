@@ -17,9 +17,7 @@ def client() -> OpenCodeClient:
 def _mock_response(*, status: int = 200, text: str = "", json_data: object = None) -> MagicMock:
     response = AsyncMock()
     response.status = status
-    response.text = AsyncMock(
-        return_value=text if json_data is None else json.dumps(json_data)
-    )
+    response.text = AsyncMock(return_value=text if json_data is None else json.dumps(json_data))
     response.request_info = MagicMock()
     response.history = ()
     cm = AsyncMock()
