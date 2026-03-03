@@ -4,18 +4,28 @@ venv/
 
 # Python
 __pycache__/
+*/__pycache__/
 *.py[cod]
 *.egg-info/
 build/
 dist/
 
 # Tooling
+.cache/
 .mypy_cache/
+.nox/
+.pyre/
 .pytest_cache/
 .ruff_cache/
+.hypothesis/
+.tox/
 .coverage
+.coverage.*
 htmlcov/
 uv.lock.bak
+
+# Legacy local caches
+src/opencode_daytona/__pycache__/
 
 # Local config
 .env
