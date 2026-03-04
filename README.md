@@ -1,14 +1,28 @@
 # Xolt
 
-Xolt is a managed execution system with a production-ready Python SDK and CLI. It separates the execution backend from the runtime layer so teams can start with Daytona + OpenCode today and extend the platform later without rewriting the public surface.
+Xolt is a sandboxed coding-subagent runtime for agent builders. It lets a parent agent or platform provision an isolated coding agent, equip it with skills and specialist subagents, and interact with it through a Python SDK or CLI.
 
-## What Xolt Does
+## Why Xolt Exists
 
-- Provisions managed execution environments through backend adapters
-- Starts and controls interactive runtimes through runtime adapters
-- Ships a real CLI for starting, attaching, stopping, and operating sessions
-- Exposes a Python SDK for applications that need programmatic control
-- Standardizes local development with `uv`, `ruff`, `mypy`, `pytest`, and `pre-commit`
+Most agent systems need execution power, but they do not want arbitrary code running inside the host process or product surface. Xolt isolates execution in a sandbox, gives that runtime its own tools, skills, and subagents, and exposes a stable interface back to the parent platform.
+
+The result is a safer and more composable way to add a capable coding subagent to:
+- agent platforms
+- orchestration frameworks
+- IDE integrations
+- developer tools
+- internal automation systems
+
+## What Xolt Provides
+
+- Provision sandboxed execution runtimes through backend adapters
+- Run a dedicated coding subagent in isolation
+- Install and manage runtime skills
+- Deploy and manage specialist subagents
+- Chat with the runtime directly or via SDK
+- Inspect files, project trees, and session diffs
+- Embed the runtime in higher-level agent systems
+- Keep execution isolated from the parent platform
 
 ## Architecture
 
@@ -26,58 +40,7 @@ The first shipped adapters are:
 - Backend: Daytona
 - Runtime: OpenCode
 
-## Install
-
-### End users
-
-```bash
-uv tool install .
-```
-
-### Contributors
-
-```bash
-uv sync --group dev
-uv run pre-commit install
-```
-
-## CLI Quickstart
-
-Set your backend credentials:
-
-```bash
-export DAYTONA_API_KEY="your-api-key"
-```
-
-Start a new session:
-
-```bash
-uv run xolt start
-```
-
-Attach to the saved session:
-
-```bash
-uv run xolt attach
-```
-
-Install runtime skills:
-
-```bash
-uv run xolt skills add browser-use/browser-use
-```
-
-Reload the runtime after changes:
-
-```bash
-uv run xolt runtime reload
-```
-
-Run environment checks:
-
-```bash
-uv run xolt doctor
-```
+This is intentionally SDK-first. The CLI is an operator surface over the same primitives.
 
 ## SDK Quickstart
 
@@ -92,10 +55,21 @@ from xolt.runtimes.opencode import OpenCodeRuntime
 async def main() -> None:
     session = await XoltSession.create(
         backend=DaytonaBackend(),
-        runtime=OpenCodeRuntime(skills=["browser-use/browser-use"]),
+        runtime=OpenCodeRuntime(
+            skills=["browser-use/browser-use"],
+            agents={
+                "reviewer": {
+                    "description": "Code review helper",
+                    "prompt": "Review changes for correctness, risks, and missing tests.",
+                }
+            },
+        ),
     )
     try:
         print(await session.preview_url())
+        print(await session.list_skills())
+        print(await session.list_agents())
+        print(await session.send_message("Summarize the repository structure."))
     finally:
         await session.close()
 
@@ -103,24 +77,146 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-## Adapter Model
+The SDK exposes:
+- runtime lifecycle control
+- skill installation and listing
+- subagent deployment and removal
+- messaging and session control
+- file and project inspection primitives
 
-Xolt intentionally keeps backend-specific and runtime-specific logic out of the top-level package import.
+## CLI Quickstart
 
-- `xolt` imports only the public session and exceptions
-- `xolt.backends.daytona` contains the Daytona adapter
-- `xolt.runtimes.opencode` contains the OpenCode adapter
+Set credentials in `.env` or your shell:
 
-This keeps `import xolt` lightweight and gives future adapters a clean integration point.
+```bash
+DAYTONA_API_KEY=your-api-key
+```
+
+Start a sandboxed runtime:
+
+```bash
+uv run xolt start --skill browser-use/browser-use
+```
+
+Open the operator console:
+
+```bash
+uv run xolt attach
+```
+
+From there you can:
+- chat with the runtime
+- list or add skills
+- list or add subagents
+- inspect files and trees
+- inspect session diffs
+
+For automation or scripting, the CLI also supports one-shot commands:
+
+```bash
+uv run xolt status
+uv run xolt open
+uv run xolt chat "Summarize the current project."
+uv run xolt skills add browser-use/browser-use
+uv run xolt agents list
+uv run xolt stop
+```
+
+## Interactive Workflow
+
+The recommended human workflow is:
+
+1. `xolt start`
+2. `xolt attach`
+3. work inside the operator console
+4. `xolt stop` when finished
+
+`xolt start` creates the remote runtime and writes a local state file at `~/.xolt/state.json`.
+
+`xolt attach` reads that saved state, reconnects to the running sandbox, validates the runtime is reachable, and opens an interactive console. Exiting the console does not delete the sandbox. `xolt stop` is the explicit destroy action.
+
+Inside the console:
+
+- plain text sends a chat prompt
+- `/help` shows commands
+- `/status` shows runtime metadata
+- `/skills` lists skills
+- `/skill add <source>` installs a skill
+- `/agents` lists subagents
+- `/agent add <name> <path>` adds a subagent
+- `/agent remove <name>` removes a subagent
+- `/files [path]` lists files
+- `/tree [path]` shows a nested tree
+- `/diff [session_id]` shows the latest session diff
+- `/reload` reloads the runtime
+- `/open` prints the preview URL
+- `/exit` leaves the console
+
+## Skill and Subagent Model
+
+Xolt treats the runtime as something that can evolve over time:
+
+- skills extend the runtime with reusable capabilities
+- subagents add specialist behavior and delegation paths
+- the parent agent or platform remains in control through the SDK or CLI
+
+This is the core value proposition: the execution agent is not static. It can be equipped and shaped to match the parent system.
+
+## Sandboxing and Safety Model
+
+Xolt assumes execution belongs inside an isolated environment rather than inside the host application process.
+
+That means:
+- the runtime executes inside a sandboxed backend
+- the parent application interacts with it through explicit APIs
+- operational controls like stop, attach, and inspection are separate from host execution
+
+The exact backend guarantees depend on the configured adapter. Today the shipped production path is Daytona plus OpenCode.
+
+## Integration Scenarios
+
+Xolt is designed for:
+
+- agent platforms that need a coding subagent
+- copilots that need isolated code execution
+- orchestration systems that want runtime-managed specialists
+- IDE experiences that need a delegated execution agent
+- products that want project inspection without direct host execution
+
+The CLI is for operators and developers. The SDK is the main embedding surface.
+
+## Current Capabilities and Roadmap
+
+### Working now
+
+- sandbox provisioning through Daytona
+- OpenCode runtime startup and attachment
+- skill installation and listing
+- subagent deployment and removal
+- one-shot chat and interactive console workflows
+- file listing, tree inspection, and session diff inspection
+- SDK and CLI control over the same runtime
+
+### Partial or evolving
+
+- provider-auth diagnostics for chat failures are improving
+- richer operator ergonomics can still improve over time
+
+### Future scope
+
+- richer streaming of project structures and file changes
+- broader backend and runtime adapter support
+- more advanced operator UX beyond the line-based console
 
 ## Development Workflow
 
 ```bash
 uv sync --group dev
+uv run pre-commit install --hook-type pre-commit --hook-type pre-push
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy src/xolt
-uv run pytest
+uv run pytest --cov=src/xolt --cov-report=term-missing
 uv run python -m build
 ```
 

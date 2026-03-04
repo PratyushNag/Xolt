@@ -7,16 +7,16 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from xolt import BackendProvisionError
+from xolt import BackendProvisionError, QuestionAskedError
 from xolt.cli import (
     add_agent,
     add_skills,
-    attach_session,
     build_backend,
     build_parser,
     build_runtime,
     chat,
     clear_state,
+    console_session,
     create_session,
     default_backend_name,
     default_runtime_name,
@@ -26,11 +26,13 @@ from xolt.cli import (
     list_runtime_skills,
     load_state,
     main,
+    open_runtime,
     reload_runtime,
     remove_agent,
     require_state,
     run_async,
     save_state,
+    status_session,
     stop_session,
     with_saved_session,
 )
@@ -39,7 +41,7 @@ from xolt.cli import (
 def make_session() -> SimpleNamespace:
     return SimpleNamespace(
         backend=SimpleNamespace(sandbox_id="sandbox-123", owns_sandbox=True),
-        session_id="session-123",
+        session_id="runtime-session-123",
         cmd_id="cmd-123",
         preview_url=AsyncMock(return_value="https://preview.example.com"),
         close=AsyncMock(),
@@ -50,7 +52,26 @@ def make_session() -> SimpleNamespace:
         add_agent=AsyncMock(),
         list_agents=AsyncMock(return_value=["reviewer"]),
         remove_agent=AsyncMock(),
+        create_chat_session=AsyncMock(return_value={"id": "chat-123"}),
         send_message=AsyncMock(return_value="reply"),
+        list_files=AsyncMock(return_value=[{"path": "src", "type": "directory"}]),
+        get_file_tree=AsyncMock(
+            return_value=[{"path": "src", "type": "directory", "children": []}]
+        ),
+        get_session_diff=AsyncMock(return_value=[{"path": "README.md", "op": "edit"}]),
+    )
+
+
+def write_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("XOLT_STATE_FILE", str(tmp_path / "state.json"))
+    save_state(
+        {
+            "backend": "daytona",
+            "runtime": "opencode",
+            "sandbox_id": "sandbox-123",
+            "session_id": "runtime-session-123",
+            "cmd_id": "cmd-123",
+        }
     )
 
 
@@ -88,12 +109,16 @@ def test_build_backend_and_runtime_success() -> None:
     assert runtime.name == "opencode"
 
 
-def test_parser_accepts_planned_commands() -> None:
+def test_parser_accepts_new_commands() -> None:
     parser = build_parser()
     assert parser.parse_args(["start"]).command == "start"
     assert parser.parse_args(["attach"]).command == "attach"
+    assert parser.parse_args(["console"]).command == "console"
+    assert parser.parse_args(["status"]).command == "status"
+    assert parser.parse_args(["open"]).command == "open"
     assert parser.parse_args(["stop"]).command == "stop"
     assert parser.parse_args(["chat", "hello"]).command == "chat"
+    assert parser.parse_args(["chat", "--interactive"]).interactive is True
     assert parser.parse_args(["skills", "add", "a/b"]).skills_command == "add"
     assert parser.parse_args(["runtime", "reload"]).runtime_command == "reload"
     assert parser.parse_args(["agents", "list"]).agents_command == "list"
@@ -115,57 +140,53 @@ async def test_start_writes_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
 
     captured = capsys.readouterr()
     assert "preview.example.com" in captured.out
+    assert "xolt attach" in captured.out
     state = load_state()
     assert state is not None
     assert state["sandbox_id"] == "sandbox-123"
 
 
 @pytest.mark.asyncio
-async def test_attach_and_stop_session_use_saved_state(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys
+async def test_status_open_console_and_stop_use_saved_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys,
 ) -> None:
-    monkeypatch.setenv("XOLT_STATE_FILE", str(tmp_path / "state.json"))
-    save_state(
-        {
-            "backend": "daytona",
-            "runtime": "opencode",
-            "sandbox_id": "sandbox-123",
-            "session_id": "session-123",
-            "cmd_id": "cmd-123",
-        }
-    )
+    write_state(monkeypatch, tmp_path)
     session = make_session()
+    inputs = iter(["/status", "/skills", "/agents", "/open", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
 
     with patch("xolt.cli.XoltSession.attach", new_callable=AsyncMock, return_value=session):
-        await attach_session(build_parser().parse_args(["attach"]))
+        await status_session(build_parser().parse_args(["status"]))
+        await open_runtime(build_parser().parse_args(["open"]))
+        await console_session(build_parser().parse_args(["attach"]))
         await stop_session(build_parser().parse_args(["stop"]))
 
     output = capsys.readouterr().out
-    assert "Sandbox: sandbox-123" in output
+    assert "Reachable: yes" in output
+    assert "Preview URL: https://preview.example.com" in output
+    assert "Attached to sandbox sandbox-123" in output
+    assert "Operator console ready." in output
+    assert "browser-use" in output
+    assert "reviewer" in output
     assert "Deleted sandbox sandbox-123" in output
     assert load_state() is None
 
 
 @pytest.mark.asyncio
-async def test_attach_and_stop_without_state_raise() -> None:
+async def test_status_console_and_stop_without_state_raise() -> None:
     with pytest.raises(SystemExit, match="No sandbox id provided"):
-        await attach_session(build_parser().parse_args(["attach"]))
+        await status_session(build_parser().parse_args(["status"]))
+    with pytest.raises(SystemExit, match="No sandbox id provided"):
+        await console_session(build_parser().parse_args(["attach"]))
     with pytest.raises(SystemExit, match="No sandbox id provided"):
         await stop_session(build_parser().parse_args(["stop"]))
 
 
 @pytest.mark.asyncio
 async def test_with_saved_session(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("XOLT_STATE_FILE", str(tmp_path / "state.json"))
-    save_state(
-        {
-            "backend": "daytona",
-            "runtime": "opencode",
-            "sandbox_id": "sandbox-123",
-            "session_id": "session-123",
-            "cmd_id": "cmd-123",
-        }
-    )
+    write_state(monkeypatch, tmp_path)
     session = make_session()
     with patch("xolt.cli.XoltSession.attach", new_callable=AsyncMock, return_value=session):
         attached = await with_saved_session()
@@ -208,23 +229,67 @@ async def test_skill_agent_and_reload_commands(capsys) -> None:
 
 
 @pytest.mark.asyncio
-async def test_chat_prompt_and_interactive_paths(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+async def test_chat_prompt_and_interactive_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    write_state(monkeypatch, tmp_path)
     session = make_session()
-    with patch("xolt.cli.with_saved_session", new_callable=AsyncMock, return_value=session):
-        await chat(argparse.Namespace(prompt="hello", session_id="chat-1"))
+    with patch("xolt.cli.XoltSession.attach", new_callable=AsyncMock, return_value=session):
+        await chat(argparse.Namespace(prompt="hello", session_id=None, interactive=False))
+
     assert "reply" in capsys.readouterr().out
+    state = load_state()
+    assert state is not None
+    assert state["chat_session_id"] == "chat-123"
+    session.send_message.assert_awaited_once_with("hello", session_id="chat-123")
 
     session = make_session()
-    inputs = iter(["", "hello", "exit"])
+    save_state(
+        {
+            "backend": "daytona",
+            "runtime": "opencode",
+            "sandbox_id": "sandbox-123",
+            "session_id": "runtime-session-123",
+            "cmd_id": "cmd-123",
+            "chat_session_id": "chat-123",
+        }
+    )
+    inputs = iter(["hello", "/files src", "/tree src", "/diff", "/exit"])
     monkeypatch.setattr("builtins.input", lambda _: next(inputs))
-    with patch("xolt.cli.with_saved_session", new_callable=AsyncMock, return_value=session):
-        await chat(argparse.Namespace(prompt=None, session_id="chat-1"))
+    with patch("xolt.cli.XoltSession.attach", new_callable=AsyncMock, return_value=session):
+        await chat(argparse.Namespace(prompt=None, session_id=None, interactive=True))
+
     captured = capsys.readouterr()
-    assert "Interactive chat. Type `exit` to quit." in captured.out
+    assert "Operator console ready." in captured.out
     assert "reply" in captured.out
+    assert "directory: src" in captured.out
+    assert "edit: README.md" in captured.out
 
 
-def test_doctor_variants(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+@pytest.mark.asyncio
+async def test_console_handles_chat_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    write_state(monkeypatch, tmp_path)
+    session = make_session()
+    session.send_message = AsyncMock(
+        side_effect=QuestionAskedError("q1", "chat-123", ["Continue?"])
+    )
+    inputs = iter(["hello", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+
+    with patch("xolt.cli.XoltSession.attach", new_callable=AsyncMock, return_value=session):
+        await console_session(build_parser().parse_args(["attach"]))
+
+    assert "Runtime asked a question" in capsys.readouterr().err
+
+
+def test_doctor_variants(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys) -> None:
+    monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("DAYTONA_API_KEY", raising=False)
     monkeypatch.setenv("XOLT_BACKEND", "unknown")
     monkeypatch.setenv("XOLT_RUNTIME", "bad")
@@ -242,11 +307,27 @@ def test_doctor_variants(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
         assert doctor() == 0
 
 
+def test_doctor_loads_dotenv_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DAYTONA_API_KEY", raising=False)
+    monkeypatch.delenv("XOLT_BACKEND", raising=False)
+    monkeypatch.delenv("XOLT_RUNTIME", raising=False)
+    (tmp_path / ".env").write_text("DAYTONA_API_KEY=test-key\n", encoding="utf-8")
+
+    with patch("xolt.cli.shutil.which", return_value="uv"):
+        assert doctor() == 0
+
+    assert "Xolt doctor checks passed." in capsys.readouterr().out
+
+
 @pytest.mark.asyncio
 async def test_run_async_dispatches() -> None:
     for argv, target in [
         (["start"], "create_session"),
-        (["attach", "sandbox-123"], "attach_session"),
+        (["attach", "sandbox-123"], "console_session"),
+        (["console", "sandbox-123"], "console_session"),
+        (["status", "sandbox-123"], "status_session"),
+        (["open"], "open_runtime"),
         (["stop", "sandbox-123"], "stop_session"),
         (["chat", "hello"], "chat"),
         (["skills", "add", "a/b"], "add_skills"),
