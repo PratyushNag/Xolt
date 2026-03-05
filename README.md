@@ -42,7 +42,7 @@ The first shipped adapters are:
 
 This is intentionally SDK-first. The CLI is an operator surface over the same primitives.
 
-## SDK Quickstart
+## SDK Quickstart (Primary Product Surface)
 
 ```python
 import asyncio
@@ -66,10 +66,20 @@ async def main() -> None:
         ),
     )
     try:
-        print(await session.preview_url())
-        print(await session.list_skills())
-        print(await session.list_agents())
-        print(await session.send_message("Summarize the repository structure."))
+        chat_id = await session.ensure_chat_session(title="SDK Demo")
+        task = await session.submit_task(
+            "Summarize the repository structure and list high-risk modules.",
+            chat_session_id=chat_id,
+            metadata={"source": "readme-demo"},
+        )
+
+        async for event in session.stream_task(task.id):
+            if event.type == "message_delta":
+                print(event.payload.get("delta", ""), end="")
+
+        result = await session.wait_task(task.id, timeout=900)
+        print("\nStatus:", result.status)
+        print("Final:", result.response)
     finally:
         await session.close()
 
@@ -79,12 +89,34 @@ asyncio.run(main())
 
 The SDK exposes:
 - runtime lifecycle control
+- persistent chat session management
+- async task submission, streaming, and waiting
+- structured task events for embedding
 - skill installation and listing
 - subagent deployment and removal
-- messaging and session control
 - file and project inspection primitives
 
-## CLI Quickstart
+### Structured Task Events
+
+`stream_task()` emits typed events with a stable envelope:
+
+- `id`
+- `type`
+- `ts`
+- `worker_id`
+- `chat_session_id`
+- `task_id`
+- `sequence`
+- `payload`
+
+Current `type` values include:
+- `message_delta`
+- `status`
+- `file_changed`
+- `question_asked`
+- `runtime_event`
+
+## CLI Quickstart (Companion Operator Surface)
 
 Set credentials in `.env` or your shell:
 
@@ -183,7 +215,7 @@ Xolt is designed for:
 - IDE experiences that need a delegated execution agent
 - products that want project inspection without direct host execution
 
-The CLI is for operators and developers. The SDK is the main embedding surface.
+The CLI is for operators and developers. The SDK is the main embedding surface and primary product focus.
 
 ## Current Capabilities and Roadmap
 
@@ -191,6 +223,8 @@ The CLI is for operators and developers. The SDK is the main embedding surface.
 
 - sandbox provisioning through Daytona
 - OpenCode runtime startup and attachment
+- persistent SDK chat sessions
+- SDK task submission and structured event streaming
 - skill installation and listing
 - subagent deployment and removal
 - one-shot chat and interactive console workflows

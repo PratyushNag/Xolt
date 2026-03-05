@@ -16,6 +16,7 @@ from xolt.exceptions import (
     XoltError,
 )
 from xolt.session import XoltSession
+from xolt.tasking import TaskEvent, TaskHandle, TaskResult, TaskStatus
 
 __all__ = [
     "AgentError",
@@ -27,6 +28,10 @@ __all__ = [
     "SessionError",
     "SkillInstallError",
     "StreamError",
+    "TaskEvent",
+    "TaskHandle",
+    "TaskResult",
+    "TaskStatus",
     "XoltError",
     "XoltSession",
     "__version__",

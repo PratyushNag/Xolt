@@ -4,11 +4,29 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
 
 from xolt.backends.base import BackendHandle, ExecutionBackend
+from xolt.exceptions import SessionError
 from xolt.runtimes.base import EventCallback, ManagedRuntime, RuntimeHandle
+from xolt.tasking import TaskEvent, TaskHandle, TaskResult, TaskStatus
+
+
+@dataclass
+class _TaskState:
+    handle: TaskHandle
+    status: TaskStatus = "running"
+    last_error: str | None = None
+    final_response: str | None = None
+    next_sequence: int = 0
+    terminal_event_emitted: bool = False
+    last_event_at: datetime | None = None
+    _queue: asyncio.Queue[TaskEvent] = field(default_factory=asyncio.Queue)
 
 
 class XoltSession:
@@ -26,6 +44,8 @@ class XoltSession:
         self.runtime = runtime
         self._backend_adapter = backend_adapter
         self._runtime_adapter = runtime_adapter
+        self._active_chat_session_id: str | None = None
+        self._tasks: dict[str, _TaskState] = {}
 
     @classmethod
     async def create(
@@ -112,10 +132,211 @@ class XoltSession:
         return await self.runtime.list_agents()
 
     async def create_chat_session(self, *, title: str | None = None) -> dict[str, Any]:
-        return await self.runtime.create_chat_session(title=title)
+        created = await self.runtime.create_chat_session(title=title)
+        chat_session_id = str(created.get("id", "")).strip()
+        if chat_session_id:
+            self._active_chat_session_id = chat_session_id
+        return created
 
     async def list_chat_sessions(self) -> list[dict[str, Any]]:
         return await self.runtime.list_chat_sessions()
+
+    @property
+    def active_chat_session_id(self) -> str | None:
+        return self._active_chat_session_id
+
+    async def ensure_chat_session(self, *, title: str | None = None) -> str:
+        if self._active_chat_session_id is not None:
+            return self._active_chat_session_id
+        created = await self.create_chat_session(title=title)
+        chat_session_id = str(created.get("id", "")).strip()
+        if not chat_session_id:
+            raise SessionError("Runtime returned a chat session without an id.")
+        self._active_chat_session_id = chat_session_id
+        return chat_session_id
+
+    def set_active_chat_session(self, chat_session_id: str) -> None:
+        resolved = chat_session_id.strip()
+        if not resolved:
+            raise SessionError("chat_session_id must be non-empty")
+        self._active_chat_session_id = resolved
+
+    async def submit_task(
+        self,
+        prompt: str,
+        *,
+        chat_session_id: str | None = None,
+        model: dict[str, str] | None = None,
+        metadata: dict[str, str] | None = None,
+    ) -> TaskHandle:
+        if not prompt.strip():
+            raise SessionError("prompt must be non-empty")
+
+        active_chat_session_id = chat_session_id
+        if active_chat_session_id is None:
+            active_chat_session_id = await self.ensure_chat_session()
+        else:
+            self.set_active_chat_session(active_chat_session_id)
+
+        await self.send_message_async(
+            prompt,
+            session_id=active_chat_session_id,
+            model=model,
+        )
+        task_handle = TaskHandle(
+            id=f"task_{uuid4().hex}",
+            chat_session_id=active_chat_session_id,
+            prompt=prompt,
+            created_at=datetime.now(timezone.utc),
+            metadata=dict(metadata or {}),
+        )
+        self._tasks[task_handle.id] = _TaskState(handle=task_handle)
+        return task_handle
+
+    async def cancel_task(self, task_id: str) -> None:
+        task = self._get_task_state(task_id)
+        await self.abort(task.handle.chat_session_id)
+        task.status = "cancelled"
+        task.last_event_at = datetime.now(timezone.utc)
+
+    async def stream_task(self, task_id: str) -> AsyncIterator[TaskEvent]:
+        task = self._get_task_state(task_id)
+        async for raw_event in self.stream_events():
+            if not self._event_matches_chat_session(raw_event, task.handle.chat_session_id):
+                continue
+            structured = self._normalize_task_event(task, raw_event)
+            task.last_event_at = structured.ts
+            await task._queue.put(structured)
+            yield structured
+            if self._is_terminal_task_event(raw_event):
+                if task.status == "running":
+                    task.status = "completed"
+                break
+
+    async def wait_task(
+        self,
+        task_id: str,
+        *,
+        timeout: float = 900,
+    ) -> TaskResult:
+        task = self._get_task_state(task_id)
+        if task.status in {"running", "pending"}:
+            try:
+                await asyncio.wait_for(self._drain_task_stream(task_id), timeout=timeout)
+            except TimeoutError:
+                task.status = "timed_out"
+                task.last_error = f"Task {task_id} timed out after {timeout}s"
+                return TaskResult(
+                    task_id=task_id,
+                    chat_session_id=task.handle.chat_session_id,
+                    status=task.status,
+                    response=task.final_response,
+                    error=task.last_error,
+                )
+            except BaseException as exc:
+                task.status = "failed"
+                task.last_error = str(exc)
+                return TaskResult(
+                    task_id=task_id,
+                    chat_session_id=task.handle.chat_session_id,
+                    status=task.status,
+                    response=task.final_response,
+                    error=task.last_error,
+                )
+
+        if task.status == "running":
+            task.status = "completed"
+
+        if task.status == "completed":
+            try:
+                messages = await self.get_messages(task.handle.chat_session_id)
+                task.final_response = self.extract_response(messages)
+            except BaseException as exc:
+                task.status = "failed"
+                task.last_error = str(exc)
+
+        return TaskResult(
+            task_id=task_id,
+            chat_session_id=task.handle.chat_session_id,
+            status=task.status,
+            response=task.final_response,
+            error=task.last_error,
+        )
+
+    def list_tasks(self) -> list[TaskHandle]:
+        return [state.handle for state in self._tasks.values()]
+
+    def get_task_status(self, task_id: str) -> TaskStatus:
+        return self._get_task_state(task_id).status
+
+    async def _drain_task_stream(self, task_id: str) -> None:
+        async for _ in self.stream_task(task_id):
+            pass
+
+    def _get_task_state(self, task_id: str) -> _TaskState:
+        task = self._tasks.get(task_id)
+        if task is None:
+            raise SessionError(f"Unknown task_id: {task_id}")
+        return task
+
+    def _normalize_task_event(self, task: _TaskState, raw_event: dict[str, Any]) -> TaskEvent:
+        raw_type = str(raw_event.get("type", "runtime.event"))
+        payload = dict(raw_event.get("properties", {}))
+        event_type = "runtime_event"
+        if raw_type == "message.part.delta":
+            event_type = "message_delta"
+            delta = payload.get("delta", payload.get("content", ""))
+            payload = {"delta": delta, "raw_type": raw_type}
+        elif raw_type == "session.status":
+            event_type = "status"
+            if payload.get("status") == "idle":
+                task.status = "completed"
+        elif raw_type == "question.asked":
+            event_type = "question_asked"
+            task.status = "blocked"
+        else:
+            classified = self.classify_file_event(raw_event)
+            if classified is not None:
+                event_type = "file_changed"
+                payload = classified
+
+        task.next_sequence += 1
+        return TaskEvent(
+            id=f"{task.handle.id}_evt_{task.next_sequence}",
+            type=event_type,
+            ts=datetime.now(timezone.utc),
+            worker_id=str(self.backend.sandbox_id),
+            chat_session_id=task.handle.chat_session_id,
+            task_id=task.handle.id,
+            sequence=task.next_sequence,
+            payload=payload,
+        )
+
+    @staticmethod
+    def _event_matches_chat_session(event: dict[str, Any], chat_session_id: str) -> bool:
+        properties = event.get("properties", {})
+        if not isinstance(properties, dict):
+            return False
+        candidates = (
+            properties.get("sessionID"),
+            properties.get("sessionId"),
+            properties.get("session_id"),
+            event.get("sessionID"),
+            event.get("sessionId"),
+            event.get("session_id"),
+        )
+        for candidate in candidates:
+            if candidate is not None and str(candidate) == chat_session_id:
+                return True
+        # Some streams do not annotate chat session ids on every message.
+        return event.get("type") == "message.part.delta"
+
+    @staticmethod
+    def _is_terminal_task_event(event: dict[str, Any]) -> bool:
+        if event.get("type") != "session.status":
+            return False
+        properties = event.get("properties", {})
+        return isinstance(properties, dict) and properties.get("status") == "idle"
 
     async def send_message(
         self,
@@ -141,11 +362,16 @@ class XoltSession:
         session_id: str | None = None,
         model: dict[str, str] | None = None,
     ) -> str:
-        return await self.runtime.send_message_async(
+        active_session_id = session_id
+        if active_session_id is None:
+            active_session_id = self._active_chat_session_id
+        response = await self.runtime.send_message_async(
             text,
-            session_id=session_id,
+            session_id=active_session_id,
             model=model,
         )
+        self._active_chat_session_id = response
+        return response
 
     async def stream_events(self) -> AsyncIterator[dict[str, Any]]:
         async for event in self.runtime.stream_events():

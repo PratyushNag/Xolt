@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from xolt.exceptions import SessionError
 from xolt.session import XoltSession
 
 
@@ -205,3 +206,115 @@ def test_static_helpers_delegate_to_runtime_handle() -> None:
     assert XoltSession.extract_text(message) == "hello"
     assert XoltSession.extract_response(messages) == "hello"
     assert XoltSession.classify_file_event(file_event) == {"op": "edit", "path": "README.md"}
+
+
+@pytest.mark.asyncio
+async def test_chat_session_management_helpers() -> None:
+    backend = SimpleNamespace(sandbox_id="sandbox-123", owns_sandbox=True)
+    runtime = make_runtime_handle()
+    session = XoltSession(
+        backend=backend,
+        runtime=runtime,
+        backend_adapter=SimpleNamespace(),
+        runtime_adapter=SimpleNamespace(),
+    )
+
+    assert await session.ensure_chat_session() == "chat-1"
+    assert session.active_chat_session_id == "chat-1"
+    assert await session.ensure_chat_session() == "chat-1"
+    runtime.create_chat_session.assert_awaited_once()
+
+    session.set_active_chat_session("chat-2")
+    assert session.active_chat_session_id == "chat-2"
+    with pytest.raises(SessionError, match="non-empty"):
+        session.set_active_chat_session("")
+
+
+@pytest.mark.asyncio
+async def test_task_lifecycle_submit_stream_wait_and_cancel() -> None:
+    backend = SimpleNamespace(sandbox_id="sandbox-123", owns_sandbox=True)
+
+    async def stream_events() -> AsyncIterator[dict[str, object]]:
+        yield {
+            "type": "message.part.delta",
+            "properties": {"sessionID": "chat-1", "delta": "Hello"},
+        }
+        yield {
+            "type": "file.edited",
+            "properties": {"sessionID": "chat-1", "file": "README.md"},
+        }
+        yield {
+            "type": "session.status",
+            "properties": {"sessionID": "chat-1", "status": "idle"},
+        }
+
+    runtime = SimpleNamespace(
+        session_id="session-123",
+        cmd_id="cmd-123",
+        installed_skills=[],
+        deployed_agents=[],
+        create_chat_session=AsyncMock(return_value={"id": "chat-1"}),
+        send_message_async=AsyncMock(return_value="chat-1"),
+        stream_events=stream_events,
+        get_messages=AsyncMock(
+            return_value=[
+                {
+                    "info": {"role": "assistant"},
+                    "parts": [{"type": "text", "text": "done"}],
+                }
+            ]
+        ),
+        abort=AsyncMock(),
+        close=AsyncMock(),
+    )
+    session = XoltSession(
+        backend=backend,
+        runtime=runtime,
+        backend_adapter=SimpleNamespace(),
+        runtime_adapter=SimpleNamespace(),
+    )
+
+    handle = await session.submit_task(
+        "Implement the feature",
+        metadata={"ticket": "ABC-123"},
+    )
+    assert handle.chat_session_id == "chat-1"
+    assert handle.metadata == {"ticket": "ABC-123"}
+    runtime.send_message_async.assert_awaited_once_with(
+        "Implement the feature",
+        session_id="chat-1",
+        model=None,
+    )
+
+    events = [event async for event in session.stream_task(handle.id)]
+    assert [event.type for event in events] == ["message_delta", "file_changed", "status"]
+    assert events[0].task_id == handle.id
+    assert events[1].payload == {"op": "edit", "path": "README.md"}
+    assert session.get_task_status(handle.id) == "completed"
+
+    result = await session.wait_task(handle.id)
+    assert result.status == "completed"
+    assert result.response == "done"
+
+    await session.cancel_task(handle.id)
+    assert session.get_task_status(handle.id) == "cancelled"
+    runtime.abort.assert_awaited_once_with("chat-1")
+
+
+@pytest.mark.asyncio
+async def test_task_helpers_raise_on_unknown_task_id() -> None:
+    backend = SimpleNamespace(sandbox_id="sandbox-123", owns_sandbox=True)
+    runtime = make_runtime_handle()
+    session = XoltSession(
+        backend=backend,
+        runtime=runtime,
+        backend_adapter=SimpleNamespace(),
+        runtime_adapter=SimpleNamespace(),
+    )
+
+    with pytest.raises(SessionError, match="Unknown task_id"):
+        _ = session.get_task_status("missing")
+    with pytest.raises(SessionError, match="Unknown task_id"):
+        await session.cancel_task("missing")
+    with pytest.raises(SessionError, match="Unknown task_id"):
+        await session.wait_task("missing")
