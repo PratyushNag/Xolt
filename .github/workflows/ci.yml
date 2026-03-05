@@ -5,19 +5,26 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
-  test:
+  quality:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.12"
       - uses: astral-sh/setup-uv@v7
-      - name: Sync dependencies
+      - name: Verify lockfile
+        run: uv lock --check
+      - name: Sync dev dependencies
         run: uv sync --group dev
       - name: Ruff
         run: uv run ruff check .
@@ -25,7 +32,39 @@ jobs:
         run: uv run ruff format --check .
       - name: MyPy
         run: uv run mypy src/xolt
-      - name: Pytest
-        run: uv run pytest --cov=src/xolt --cov-report=term-missing
       - name: Build
         run: uv run python -m build
+
+  tests:
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@v7
+      - name: Sync dev dependencies
+        run: uv sync --group dev
+      - name: Pytest (no coverage)
+        run: uv run pytest -q
+
+  coverage:
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v7
+      - name: Sync dev dependencies
+        run: uv sync --group dev
+      - name: Pytest with coverage
+        run: uv run pytest --cov=src/xolt --cov-report=term-missing
