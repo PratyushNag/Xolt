@@ -238,11 +238,28 @@ class XoltSession:
         task.last_event_at = datetime.now(timezone.utc)
 
     async def stream_task(self, task_id: str) -> AsyncIterator[TaskEvent]:
+        async for event in self.stream_task_from(task_id, from_sequence=0):
+            yield event
+
+    async def stream_task_from(
+        self,
+        task_id: str,
+        *,
+        from_sequence: int = 0,
+    ) -> AsyncIterator[TaskEvent]:
         task = self._get_task_state(task_id)
+        for cached in task.events:
+            if cached.sequence > from_sequence:
+                yield cached
+        if task.status in {"completed", "failed", "cancelled", "timed_out"}:
+            return
+
         async for raw_event in self.stream_events():
             if not self._event_matches_chat_session(raw_event, task.handle.chat_session_id):
                 continue
             structured = self._normalize_task_event(task, raw_event)
+            if structured.sequence <= from_sequence:
+                continue
             task.last_event_at = structured.ts
             await task._queue.put(structured)
             yield structured
@@ -256,11 +273,15 @@ class XoltSession:
         task_id: str,
         *,
         timeout: float = 900,
+        from_sequence: int = 0,
     ) -> TaskResult:
         task = self._get_task_state(task_id)
         if task.status in {"running", "pending"}:
             try:
-                await asyncio.wait_for(self._drain_task_stream(task_id), timeout=timeout)
+                await asyncio.wait_for(
+                    self._drain_task_stream(task_id, from_sequence=from_sequence),
+                    timeout=timeout,
+                )
             except TimeoutError:
                 task.status = "timed_out"
                 task.last_error = f"Task {task_id} timed out after {timeout}s"
@@ -272,8 +293,10 @@ class XoltSession:
                     error=task.last_error,
                 )
             except BaseException as exc:
-                task.status = "failed"
-                task.last_error = str(exc)
+                recovered = await self._recover_task_after_stream_failure(task, exc)
+                if not recovered:
+                    task.status = "failed"
+                    task.last_error = str(exc)
                 return TaskResult(
                     task_id=task_id,
                     chat_session_id=task.handle.chat_session_id,
@@ -368,9 +391,27 @@ class XoltSession:
     def get_task_status(self, task_id: str) -> TaskStatus:
         return self._get_task_state(task_id).status
 
-    async def _drain_task_stream(self, task_id: str) -> None:
-        async for _ in self.stream_task(task_id):
+    async def _drain_task_stream(self, task_id: str, *, from_sequence: int = 0) -> None:
+        async for _ in self.stream_task_from(task_id, from_sequence=from_sequence):
             pass
+
+    async def _recover_task_after_stream_failure(
+        self,
+        task: _TaskState,
+        stream_error: BaseException,
+    ) -> bool:
+        task.last_error = str(stream_error)
+        try:
+            messages = await self.get_messages(task.handle.chat_session_id)
+            response = self.extract_response(messages)
+        except BaseException:
+            return False
+
+        if not response or response == "(no response)":
+            return False
+        task.final_response = response
+        task.status = "completed"
+        return True
 
     def _get_task_state(self, task_id: str) -> _TaskState:
         task = self._tasks.get(task_id)

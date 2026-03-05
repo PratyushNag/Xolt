@@ -316,6 +316,9 @@ async def test_task_lifecycle_submit_stream_wait_and_cancel() -> None:
     assert session.get_task_status(handle.id) == "cancelled"
     runtime.abort.assert_awaited_once_with("chat-1")
 
+    resumed = [event async for event in session.stream_task_from(handle.id, from_sequence=2)]
+    assert [event.sequence for event in resumed] == [3]
+
 
 @pytest.mark.asyncio
 async def test_task_helpers_raise_on_unknown_task_id() -> None:
@@ -402,3 +405,43 @@ async def test_register_task_explicit_recovery() -> None:
         session.register_task("", chat_session_id="chat-9")
     with pytest.raises(SessionError, match="chat_session_id must be non-empty"):
         session.register_task("task-x", chat_session_id="")
+
+
+@pytest.mark.asyncio
+async def test_wait_task_recovers_when_stream_fails() -> None:
+    backend = SimpleNamespace(sandbox_id="sandbox-123", owns_sandbox=True)
+
+    async def broken_stream() -> AsyncIterator[dict[str, object]]:
+        raise RuntimeError("stale stream")
+        yield {}
+
+    runtime = SimpleNamespace(
+        session_id="session-123",
+        cmd_id="cmd-123",
+        installed_skills=[],
+        deployed_agents=[],
+        create_chat_session=AsyncMock(return_value={"id": "chat-1"}),
+        send_message_async=AsyncMock(return_value="chat-1"),
+        stream_events=broken_stream,
+        get_messages=AsyncMock(
+            return_value=[
+                {
+                    "info": {"role": "assistant"},
+                    "parts": [{"type": "text", "text": "Recovered response"}],
+                }
+            ]
+        ),
+        abort=AsyncMock(),
+        close=AsyncMock(),
+    )
+    session = XoltSession(
+        backend=backend,
+        runtime=runtime,
+        backend_adapter=SimpleNamespace(),
+        runtime_adapter=SimpleNamespace(),
+    )
+
+    handle = await session.submit_task("Recover this task")
+    result = await session.wait_task(handle.id)
+    assert result.status == "completed"
+    assert result.response == "Recovered response"
