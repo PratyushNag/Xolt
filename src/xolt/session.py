@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -14,7 +16,15 @@ from uuid import uuid4
 from xolt.backends.base import BackendHandle, ExecutionBackend
 from xolt.exceptions import SessionError
 from xolt.runtimes.base import EventCallback, ManagedRuntime, RuntimeHandle
-from xolt.tasking import TaskEvent, TaskHandle, TaskResult, TaskStatus
+from xolt.tasking import (
+    TaskArtifact,
+    TaskDiffEntry,
+    TaskEvent,
+    TaskFileChange,
+    TaskHandle,
+    TaskResult,
+    TaskStatus,
+)
 
 
 @dataclass
@@ -26,6 +36,8 @@ class _TaskState:
     next_sequence: int = 0
     terminal_event_emitted: bool = False
     last_event_at: datetime | None = None
+    file_changes: list[TaskFileChange] = field(default_factory=list)
+    events: list[TaskEvent] = field(default_factory=list)
     _queue: asyncio.Queue[TaskEvent] = field(default_factory=asyncio.Queue)
 
 
@@ -184,7 +196,7 @@ class XoltSession:
             model=model,
         )
         task_handle = TaskHandle(
-            id=f"task_{uuid4().hex}",
+            id=self._make_task_id(active_chat_session_id),
             chat_session_id=active_chat_session_id,
             prompt=prompt,
             created_at=datetime.now(timezone.utc),
@@ -192,6 +204,32 @@ class XoltSession:
         )
         self._tasks[task_handle.id] = _TaskState(handle=task_handle)
         return task_handle
+
+    def register_task(
+        self,
+        task_id: str,
+        *,
+        chat_session_id: str,
+        prompt: str = "",
+        created_at: datetime | None = None,
+        metadata: dict[str, str] | None = None,
+        status: TaskStatus = "pending",
+    ) -> TaskHandle:
+        resolved_task_id = task_id.strip()
+        resolved_chat_session_id = chat_session_id.strip()
+        if not resolved_task_id:
+            raise SessionError("task_id must be non-empty")
+        if not resolved_chat_session_id:
+            raise SessionError("chat_session_id must be non-empty")
+        handle = TaskHandle(
+            id=resolved_task_id,
+            chat_session_id=resolved_chat_session_id,
+            prompt=prompt,
+            created_at=created_at or datetime.now(timezone.utc),
+            metadata=dict(metadata or {}),
+        )
+        self._tasks[resolved_task_id] = _TaskState(handle=handle, status=status)
+        return handle
 
     async def cancel_task(self, task_id: str) -> None:
         task = self._get_task_state(task_id)
@@ -263,6 +301,67 @@ class XoltSession:
             error=task.last_error,
         )
 
+    async def get_task_changes(self, task_id: str) -> list[TaskFileChange]:
+        task = self._get_task_state(task_id)
+        return list(task.file_changes)
+
+    async def get_task_diff(self, task_id: str) -> list[TaskDiffEntry]:
+        task = self._get_task_state(task_id)
+        raw_entries = await self.get_session_diff(task.handle.chat_session_id)
+        entries: list[TaskDiffEntry] = []
+        for entry in raw_entries:
+            if not isinstance(entry, dict):
+                continue
+            path = str(entry.get("path", ""))
+            operation = str(entry.get("op") or entry.get("status") or "change")
+            entries.append(
+                TaskDiffEntry(
+                    task_id=task_id,
+                    chat_session_id=task.handle.chat_session_id,
+                    path=path,
+                    operation=operation,
+                    raw=entry,
+                )
+            )
+        return entries
+
+    async def list_task_artifacts(self, task_id: str) -> list[TaskArtifact]:
+        task = self._get_task_state(task_id)
+        artifacts: list[TaskArtifact] = [
+            TaskArtifact(
+                id=f"{task_id}:messages",
+                task_id=task_id,
+                kind="messages",
+                name="chat_messages",
+                metadata={"chat_session_id": task.handle.chat_session_id},
+            ),
+            TaskArtifact(
+                id=f"{task_id}:diff",
+                task_id=task_id,
+                kind="diff",
+                name="session_diff",
+                metadata={"chat_session_id": task.handle.chat_session_id},
+            ),
+            TaskArtifact(
+                id=f"{task_id}:file_changes",
+                task_id=task_id,
+                kind="file_changes",
+                name="file_changes",
+                metadata={"count": str(len(task.file_changes))},
+            ),
+        ]
+        if task.final_response is not None:
+            artifacts.append(
+                TaskArtifact(
+                    id=f"{task_id}:response",
+                    task_id=task_id,
+                    kind="response",
+                    name="final_response",
+                    metadata={"chars": str(len(task.final_response))},
+                )
+            )
+        return artifacts
+
     def list_tasks(self) -> list[TaskHandle]:
         return [state.handle for state in self._tasks.values()]
 
@@ -275,9 +374,52 @@ class XoltSession:
 
     def _get_task_state(self, task_id: str) -> _TaskState:
         task = self._tasks.get(task_id)
-        if task is None:
+        if task is not None:
+            return task
+
+        restored = self._restore_task_from_id(task_id)
+        if restored is None:
             raise SessionError(f"Unknown task_id: {task_id}")
+        self._tasks[task_id] = restored
+        task = restored
         return task
+
+    @staticmethod
+    def _encode_chat_session_id(chat_session_id: str) -> str:
+        raw = chat_session_id.encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    @staticmethod
+    def _decode_chat_session_token(token: str) -> str | None:
+        try:
+            padding = "=" * ((4 - (len(token) % 4)) % 4)
+            decoded = base64.urlsafe_b64decode(f"{token}{padding}".encode("ascii"))
+            return decoded.decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError):
+            return None
+
+    def _make_task_id(self, chat_session_id: str) -> str:
+        token = self._encode_chat_session_id(chat_session_id)
+        return f"task_{token}_{uuid4().hex}"
+
+    def _restore_task_from_id(self, task_id: str) -> _TaskState | None:
+        if not task_id.startswith("task_"):
+            return None
+        _, _, remainder = task_id.partition("task_")
+        token, separator, unique = remainder.partition("_")
+        if not separator or not token or not unique:
+            return None
+        chat_session_id = self._decode_chat_session_token(token)
+        if not chat_session_id:
+            return None
+        handle = TaskHandle(
+            id=task_id,
+            chat_session_id=chat_session_id,
+            prompt="",
+            created_at=datetime.now(timezone.utc),
+            metadata={"restored": "true"},
+        )
+        return _TaskState(handle=handle, status="pending")
 
     def _normalize_task_event(self, task: _TaskState, raw_event: dict[str, Any]) -> TaskEvent:
         raw_type = str(raw_event.get("type", "runtime.event"))
@@ -301,7 +443,7 @@ class XoltSession:
                 payload = classified
 
         task.next_sequence += 1
-        return TaskEvent(
+        event = TaskEvent(
             id=f"{task.handle.id}_evt_{task.next_sequence}",
             type=event_type,
             ts=datetime.now(timezone.utc),
@@ -311,6 +453,22 @@ class XoltSession:
             sequence=task.next_sequence,
             payload=payload,
         )
+        task.events.append(event)
+        if event_type == "file_changed":
+            path = str(payload.get("path", "")).strip()
+            operation = str(payload.get("op", "change")).strip() or "change"
+            if path:
+                task.file_changes.append(
+                    TaskFileChange(
+                        task_id=task.handle.id,
+                        chat_session_id=task.handle.chat_session_id,
+                        path=path,
+                        operation=operation,
+                        sequence=event.sequence,
+                        ts=event.ts,
+                    )
+                )
+        return event
 
     @staticmethod
     def _event_matches_chat_session(event: dict[str, Any], chat_session_id: str) -> bool:

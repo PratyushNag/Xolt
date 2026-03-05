@@ -17,6 +17,7 @@ TaskStatus = Literal[
     "timed_out",
     "blocked",
 ]
+ArtifactKind = Literal["messages", "diff", "file_changes", "response"]
 
 
 @dataclass(frozen=True)
@@ -53,3 +54,37 @@ class TaskEvent:
     task_id: str
     sequence: int
     payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class TaskFileChange:
+    """A normalized file change discovered while a task was running."""
+
+    task_id: str
+    chat_session_id: str
+    path: str
+    operation: str
+    sequence: int
+    ts: datetime
+
+
+@dataclass(frozen=True)
+class TaskDiffEntry:
+    """A normalized diff entry for a completed or in-progress task."""
+
+    task_id: str
+    chat_session_id: str
+    path: str
+    operation: str
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class TaskArtifact:
+    """A discoverable artifact associated with a task."""
+
+    id: str
+    task_id: str
+    kind: ArtifactKind
+    name: str
+    metadata: dict[str, str] = field(default_factory=dict)

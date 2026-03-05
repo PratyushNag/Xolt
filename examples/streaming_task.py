@@ -36,6 +36,13 @@ async def main() -> None:
             print(f"Result response: {result.response}")
         if result.error:
             print(f"Result error: {result.error}")
+
+        changes = await session.get_task_changes(task.id)
+        diff = await session.get_task_diff(task.id)
+        artifacts = await session.list_task_artifacts(task.id)
+        print(f"File changes: {len(changes)}")
+        print(f"Diff entries: {len(diff)}")
+        print(f"Artifacts: {[artifact.kind for artifact in artifacts]}")
     finally:
         await session.close()
 

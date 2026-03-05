@@ -264,6 +264,7 @@ async def test_task_lifecycle_submit_stream_wait_and_cancel() -> None:
                 }
             ]
         ),
+        get_session_diff=AsyncMock(return_value=[{"path": "README.md", "op": "edit"}]),
         abort=AsyncMock(),
         close=AsyncMock(),
     )
@@ -291,10 +292,25 @@ async def test_task_lifecycle_submit_stream_wait_and_cancel() -> None:
     assert events[0].task_id == handle.id
     assert events[1].payload == {"op": "edit", "path": "README.md"}
     assert session.get_task_status(handle.id) == "completed"
+    changes = await session.get_task_changes(handle.id)
+    assert len(changes) == 1
+    assert changes[0].path == "README.md"
+    assert changes[0].operation == "edit"
+    diff = await session.get_task_diff(handle.id)
+    assert len(diff) == 1
+    assert diff[0].path == "README.md"
+    assert diff[0].operation == "edit"
 
     result = await session.wait_task(handle.id)
     assert result.status == "completed"
     assert result.response == "done"
+    artifacts = await session.list_task_artifacts(handle.id)
+    assert {artifact.kind for artifact in artifacts} == {
+        "messages",
+        "diff",
+        "file_changes",
+        "response",
+    }
 
     await session.cancel_task(handle.id)
     assert session.get_task_status(handle.id) == "cancelled"
@@ -318,3 +334,71 @@ async def test_task_helpers_raise_on_unknown_task_id() -> None:
         await session.cancel_task("missing")
     with pytest.raises(SessionError, match="Unknown task_id"):
         await session.wait_task("missing")
+    with pytest.raises(SessionError, match="Unknown task_id"):
+        await session.get_task_changes("missing")
+    with pytest.raises(SessionError, match="Unknown task_id"):
+        await session.get_task_diff("missing")
+    with pytest.raises(SessionError, match="Unknown task_id"):
+        await session.list_task_artifacts("missing")
+
+
+@pytest.mark.asyncio
+async def test_task_reconnect_reconstructs_from_task_id() -> None:
+    backend = SimpleNamespace(sandbox_id="sandbox-123", owns_sandbox=True)
+    runtime = make_runtime_handle()
+    session_one = XoltSession(
+        backend=backend,
+        runtime=runtime,
+        backend_adapter=SimpleNamespace(),
+        runtime_adapter=SimpleNamespace(),
+    )
+
+    handle = await session_one.submit_task("Do something")
+    assert handle.id.startswith("task_")
+
+    runtime_two = make_runtime_handle()
+    runtime_two.get_session_diff = AsyncMock(return_value=[{"path": "README.md", "op": "edit"}])
+    session_two = XoltSession(
+        backend=backend,
+        runtime=runtime_two,
+        backend_adapter=SimpleNamespace(),
+        runtime_adapter=SimpleNamespace(),
+    )
+
+    diff = await session_two.get_task_diff(handle.id)
+    assert len(diff) == 1
+    assert diff[0].path == "README.md"
+    runtime_two.get_session_diff.assert_awaited_once_with(handle.chat_session_id)
+
+    artifacts = await session_two.list_task_artifacts(handle.id)
+    kinds = {artifact.kind for artifact in artifacts}
+    assert kinds == {"messages", "diff", "file_changes"}
+    assert session_two.get_task_status(handle.id) == "pending"
+
+
+@pytest.mark.asyncio
+async def test_register_task_explicit_recovery() -> None:
+    backend = SimpleNamespace(sandbox_id="sandbox-123", owns_sandbox=True)
+    runtime = make_runtime_handle()
+    session = XoltSession(
+        backend=backend,
+        runtime=runtime,
+        backend_adapter=SimpleNamespace(),
+        runtime_adapter=SimpleNamespace(),
+    )
+
+    registered = session.register_task(
+        "legacy-task-id",
+        chat_session_id="chat-9",
+        prompt="Legacy prompt",
+        metadata={"source": "import"},
+        status="running",
+    )
+    assert registered.id == "legacy-task-id"
+    assert registered.chat_session_id == "chat-9"
+    assert session.get_task_status("legacy-task-id") == "running"
+
+    with pytest.raises(SessionError, match="task_id must be non-empty"):
+        session.register_task("", chat_session_id="chat-9")
+    with pytest.raises(SessionError, match="chat_session_id must be non-empty"):
+        session.register_task("task-x", chat_session_id="")

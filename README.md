@@ -92,6 +92,7 @@ The SDK exposes:
 - persistent chat session management
 - async task submission, streaming, and waiting
 - structured task events for embedding
+- explicit task output contracts (`get_task_changes`, `get_task_diff`, `list_task_artifacts`)
 - skill installation and listing
 - subagent deployment and removal
 - file and project inspection primitives
