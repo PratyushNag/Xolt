@@ -17,7 +17,7 @@ TaskStatus = Literal[
     "timed_out",
     "blocked",
 ]
-ArtifactKind = Literal["messages", "diff", "file_changes", "response"]
+ArtifactKind = Literal["messages", "diff", "file_changes", "response", "blocker"]
 
 
 @dataclass(frozen=True)
@@ -88,3 +88,16 @@ class TaskArtifact:
     kind: ArtifactKind
     name: str
     metadata: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class TaskBlocker:
+    """Blocking question payload for a task that needs user input."""
+
+    task_id: str
+    chat_session_id: str
+    question_id: str
+    questions: object
+    streamed_text: str
+    payload: dict[str, Any]
+    seen_at: datetime

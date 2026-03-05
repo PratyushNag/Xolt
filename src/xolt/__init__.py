@@ -18,6 +18,7 @@ from xolt.exceptions import (
 from xolt.session import XoltSession
 from xolt.tasking import (
     TaskArtifact,
+    TaskBlocker,
     TaskDiffEntry,
     TaskEvent,
     TaskFileChange,
@@ -37,6 +38,7 @@ __all__ = [
     "SkillInstallError",
     "StreamError",
     "TaskArtifact",
+    "TaskBlocker",
     "TaskDiffEntry",
     "TaskEvent",
     "TaskFileChange",

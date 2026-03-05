@@ -343,6 +343,11 @@ async def test_task_helpers_raise_on_unknown_task_id() -> None:
         await session.get_task_diff("missing")
     with pytest.raises(SessionError, match="Unknown task_id"):
         await session.list_task_artifacts("missing")
+    with pytest.raises(SessionError, match="Unknown task_id"):
+        _ = session.is_task_blocked("missing")
+    with pytest.raises(SessionError, match="Unknown task_id"):
+        _ = session.get_task_blocker("missing")
+    assert session.list_blocked_tasks() == []
 
 
 @pytest.mark.asyncio
@@ -445,3 +450,162 @@ async def test_wait_task_recovers_when_stream_fails() -> None:
     result = await session.wait_task(handle.id)
     assert result.status == "completed"
     assert result.response == "Recovered response"
+
+
+@pytest.mark.asyncio
+async def test_blocked_task_helpers_and_resume() -> None:
+    backend = SimpleNamespace(sandbox_id="sandbox-123", owns_sandbox=True)
+
+    async def blocked_stream() -> AsyncIterator[dict[str, object]]:
+        yield {
+            "type": "question.asked",
+            "properties": {
+                "sessionID": "chat-1",
+                "id": "q-1",
+                "questions": ["Apply this migration?"],
+            },
+        }
+
+    runtime = SimpleNamespace(
+        session_id="session-123",
+        cmd_id="cmd-123",
+        installed_skills=[],
+        deployed_agents=[],
+        create_chat_session=AsyncMock(return_value={"id": "chat-1"}),
+        send_message_async=AsyncMock(return_value="chat-1"),
+        stream_events=blocked_stream,
+        get_messages=AsyncMock(return_value=[]),
+        get_session_diff=AsyncMock(return_value=[]),
+        abort=AsyncMock(),
+        close=AsyncMock(),
+    )
+    session = XoltSession(
+        backend=backend,
+        runtime=runtime,
+        backend_adapter=SimpleNamespace(),
+        runtime_adapter=SimpleNamespace(),
+    )
+
+    handle = await session.submit_task("Apply migration")
+    events = [event async for event in session.stream_task(handle.id)]
+    assert [event.type for event in events] == ["question_asked"]
+    assert session.is_task_blocked(handle.id) is True
+
+    blocker = session.get_task_blocker(handle.id)
+    assert blocker is not None
+    assert blocker.question_id == "q-1"
+    assert blocker.questions == ["Apply this migration?"]
+
+    result = await session.wait_task(handle.id)
+    assert result.status == "blocked"
+
+    artifacts = await session.list_task_artifacts(handle.id)
+    assert "blocker" in {artifact.kind for artifact in artifacts}
+    assert session.list_blocked_tasks() == [handle]
+
+    resumed_handle = await session.resume_blocked_task(handle.id, "Yes, apply it.")
+    assert resumed_handle.id == handle.id
+    assert session.get_task_status(handle.id) == "running"
+    runtime.send_message_async.assert_awaited_with(
+        "Yes, apply it.",
+        session_id="chat-1",
+        model=None,
+    )
+    assert session.get_task_blocker(handle.id) is None
+
+    with pytest.raises(SessionError, match="is not blocked"):
+        await session.resume_blocked_task(handle.id, "Again")
+    with pytest.raises(SessionError, match="answer must be non-empty"):
+        # force blocked again for validation path
+        session.register_task("task_x", chat_session_id="chat-1", status="blocked")
+        await session.resume_blocked_task("task_x", "")
+
+
+@pytest.mark.asyncio
+async def test_multi_turn_multi_task_workflow() -> None:
+    backend = SimpleNamespace(sandbox_id="sandbox-123", owns_sandbox=True)
+    stream_batches: list[list[dict[str, object]]] = [
+        [
+            {
+                "type": "message.part.delta",
+                "properties": {"sessionID": "chat-1", "delta": "First "},
+            },
+            {
+                "type": "session.status",
+                "properties": {"sessionID": "chat-1", "status": "idle"},
+            },
+        ],
+        [
+            {
+                "type": "message.part.delta",
+                "properties": {"sessionID": "chat-1", "delta": "Second "},
+            },
+            {
+                "type": "file.edited",
+                "properties": {"sessionID": "chat-1", "file": "src/main.py"},
+            },
+            {
+                "type": "session.status",
+                "properties": {"sessionID": "chat-1", "status": "idle"},
+            },
+        ],
+    ]
+
+    async def stream_events() -> AsyncIterator[dict[str, object]]:
+        if not stream_batches:
+            return
+        for event in stream_batches.pop(0):
+            yield event
+
+    runtime = SimpleNamespace(
+        session_id="session-123",
+        cmd_id="cmd-123",
+        installed_skills=[],
+        deployed_agents=[],
+        create_chat_session=AsyncMock(return_value={"id": "chat-1"}),
+        send_message_async=AsyncMock(return_value="chat-1"),
+        stream_events=stream_events,
+        get_messages=AsyncMock(
+            side_effect=[
+                [
+                    {
+                        "info": {"role": "assistant"},
+                        "parts": [{"type": "text", "text": "first done"}],
+                    }
+                ],
+                [
+                    {
+                        "info": {"role": "assistant"},
+                        "parts": [{"type": "text", "text": "second done"}],
+                    }
+                ],
+            ]
+        ),
+        get_session_diff=AsyncMock(return_value=[{"path": "src/main.py", "op": "edit"}]),
+        abort=AsyncMock(),
+        close=AsyncMock(),
+    )
+    session = XoltSession(
+        backend=backend,
+        runtime=runtime,
+        backend_adapter=SimpleNamespace(),
+        runtime_adapter=SimpleNamespace(),
+    )
+
+    chat_id = await session.ensure_chat_session(title="multi-turn")
+    first = await session.submit_task("Task 1", chat_session_id=chat_id)
+    second = await session.submit_task("Task 2", chat_session_id=chat_id)
+
+    first_events = [event async for event in session.stream_task(first.id)]
+    second_events = [event async for event in session.stream_task(second.id)]
+    first_result = await session.wait_task(first.id)
+    second_result = await session.wait_task(second.id)
+
+    assert first.chat_session_id == second.chat_session_id == "chat-1"
+    assert [event.type for event in first_events] == ["message_delta", "status"]
+    assert [event.type for event in second_events] == ["message_delta", "file_changed", "status"]
+    assert first_result.response == "first done"
+    assert second_result.response == "second done"
+    changes = await session.get_task_changes(second.id)
+    assert len(changes) == 1
+    assert changes[0].path == "src/main.py"

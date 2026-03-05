@@ -94,6 +94,7 @@ The SDK exposes:
 - structured task events for embedding
 - explicit task output contracts (`get_task_changes`, `get_task_diff`, `list_task_artifacts`)
 - cursor-based stream resume (`stream_task_from(task_id, from_sequence=...)`)
+- blocked-task recovery helpers (`is_task_blocked`, `get_task_blocker`, `resume_blocked_task`)
 - skill installation and listing
 - subagent deployment and removal
 - file and project inspection primitives
@@ -218,6 +219,14 @@ Xolt is designed for:
 - products that want project inspection without direct host execution
 
 The CLI is for operators and developers. The SDK is the main embedding surface and primary product focus.
+
+## Embedding Reference Examples
+
+SDK embedding references are provided in `examples/`:
+
+- `embedding_web_backend.py` - stream task events to clients over SSE
+- `embedding_queue_worker.py` - run offline queue jobs with SDK task streaming
+- `embedding_ide_plugin_loop.py` - plugin-style event bridge with blocked-task recovery
 
 ## Current Capabilities and Roadmap
 

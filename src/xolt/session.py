@@ -18,6 +18,7 @@ from xolt.exceptions import SessionError
 from xolt.runtimes.base import EventCallback, ManagedRuntime, RuntimeHandle
 from xolt.tasking import (
     TaskArtifact,
+    TaskBlocker,
     TaskDiffEntry,
     TaskEvent,
     TaskFileChange,
@@ -38,6 +39,7 @@ class _TaskState:
     last_event_at: datetime | None = None
     file_changes: list[TaskFileChange] = field(default_factory=list)
     events: list[TaskEvent] = field(default_factory=list)
+    blocker: TaskBlocker | None = None
     _queue: asyncio.Queue[TaskEvent] = field(default_factory=asyncio.Queue)
 
 
@@ -236,6 +238,29 @@ class XoltSession:
         await self.abort(task.handle.chat_session_id)
         task.status = "cancelled"
         task.last_event_at = datetime.now(timezone.utc)
+        task.blocker = None
+
+    async def resume_blocked_task(
+        self,
+        task_id: str,
+        answer: str,
+        *,
+        model: dict[str, str] | None = None,
+    ) -> TaskHandle:
+        task = self._get_task_state(task_id)
+        if task.status != "blocked":
+            raise SessionError(f"Task {task_id} is not blocked.")
+        if not answer.strip():
+            raise SessionError("answer must be non-empty")
+        await self.send_message_async(
+            answer,
+            session_id=task.handle.chat_session_id,
+            model=model,
+        )
+        task.status = "running"
+        task.last_error = None
+        task.blocker = None
+        return task.handle
 
     async def stream_task(self, task_id: str) -> AsyncIterator[TaskEvent]:
         async for event in self.stream_task_from(task_id, from_sequence=0):
@@ -383,6 +408,16 @@ class XoltSession:
                     metadata={"chars": str(len(task.final_response))},
                 )
             )
+        if task.blocker is not None:
+            artifacts.append(
+                TaskArtifact(
+                    id=f"{task_id}:blocker",
+                    task_id=task_id,
+                    kind="blocker",
+                    name="blocking_question",
+                    metadata={"question_id": task.blocker.question_id},
+                )
+            )
         return artifacts
 
     def list_tasks(self) -> list[TaskHandle]:
@@ -390,6 +425,17 @@ class XoltSession:
 
     def get_task_status(self, task_id: str) -> TaskStatus:
         return self._get_task_state(task_id).status
+
+    def is_task_blocked(self, task_id: str) -> bool:
+        task = self._get_task_state(task_id)
+        return task.status == "blocked"
+
+    def get_task_blocker(self, task_id: str) -> TaskBlocker | None:
+        task = self._get_task_state(task_id)
+        return task.blocker
+
+    def list_blocked_tasks(self) -> list[TaskHandle]:
+        return [task.handle for task in self._tasks.values() if task.status == "blocked"]
 
     async def _drain_task_stream(self, task_id: str, *, from_sequence: int = 0) -> None:
         async for _ in self.stream_task_from(task_id, from_sequence=from_sequence):
@@ -477,6 +523,16 @@ class XoltSession:
         elif raw_type == "question.asked":
             event_type = "question_asked"
             task.status = "blocked"
+            task.last_error = "Task blocked: runtime asked a question."
+            task.blocker = TaskBlocker(
+                task_id=task.handle.id,
+                chat_session_id=task.handle.chat_session_id,
+                question_id=str(payload.get("id", "")),
+                questions=payload.get("questions", []),
+                streamed_text=str(payload.get("streamedText", "")),
+                payload=payload,
+                seen_at=datetime.now(timezone.utc),
+            )
         else:
             classified = self.classify_file_event(raw_event)
             if classified is not None:
@@ -532,6 +588,8 @@ class XoltSession:
 
     @staticmethod
     def _is_terminal_task_event(event: dict[str, Any]) -> bool:
+        if event.get("type") == "question.asked":
+            return True
         if event.get("type") != "session.status":
             return False
         properties = event.get("properties", {})
