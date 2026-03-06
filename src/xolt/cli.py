@@ -406,7 +406,12 @@ def _print_chat_error(exc: BaseException) -> None:
 
 def _print_blocker(blocker: TaskBlocker) -> None:
     print("Task blocked. Runtime asked:")
-    for index, question in enumerate(blocker.questions, start=1):
+    raw_questions = blocker.questions
+    if not isinstance(raw_questions, list):
+        print(raw_questions)
+        return
+    questions = [str(question) for question in raw_questions]
+    for index, question in enumerate(questions, start=1):
         print(f"{index}. {question}")
 
 
@@ -770,12 +775,14 @@ async def _handle_companion_command(
 async def _resolve_companion_chat_session(
     args: argparse.Namespace,
     session: XoltSession,
-) -> str:
+) -> str | None:
     if args.chat_session_id:
-        update_state({"chat_session_id": args.chat_session_id})
-        return args.chat_session_id
+        resolved_chat_session_id: str = args.chat_session_id
+        update_state({"chat_session_id": resolved_chat_session_id})
+        return resolved_chat_session_id
     state = load_state() or {}
-    existing = state.get("chat_session_id")
+    raw_existing = state.get("chat_session_id")
+    existing = raw_existing.strip() if isinstance(raw_existing, str) else None
     sandbox_id = state.get("sandbox_id")
     if existing and session.backend.sandbox_id == sandbox_id:
         return existing
@@ -1035,7 +1042,7 @@ async def companion_session(args: argparse.Namespace) -> None:
         print(f"Preview: {preview_url}")
         print("Parent-platform companion ready. Type /help for commands. Type /exit to leave.")
 
-        active_chat_session_id = await _resolve_companion_chat_session(args, session)
+        active_chat_session_id: str | None = await _resolve_companion_chat_session(args, session)
         effective_state["chat_session_id"] = active_chat_session_id
 
         while True:

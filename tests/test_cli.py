@@ -194,7 +194,11 @@ async def test_status_open_console_and_stop_use_saved_state(
 
 
 @pytest.mark.asyncio
-async def test_status_console_and_stop_without_state_raise() -> None:
+async def test_status_console_and_stop_without_state_raise(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("XOLT_STATE_FILE", str(tmp_path / "state.json"))
+    clear_state()
     with pytest.raises(SystemExit, match="No sandbox id provided"):
         await status_session(build_parser().parse_args(["status"]))
     with pytest.raises(SystemExit, match="No sandbox id provided"):
@@ -256,7 +260,9 @@ async def test_chat_prompt_and_interactive_paths(
     write_state(monkeypatch, tmp_path)
     session = make_session()
     with patch("xolt.cli.XoltSession.attach", new_callable=AsyncMock, return_value=session):
-        await chat(argparse.Namespace(prompt="hello", session_id=None, interactive=False))
+        await chat(
+            argparse.Namespace(prompt="hello", session_id=None, interactive=False, raw_event=False)
+        )
 
     assert "reply" in capsys.readouterr().out
     state = load_state()
@@ -278,7 +284,9 @@ async def test_chat_prompt_and_interactive_paths(
     inputs = iter(["hello", "/files src", "/tree src", "/diff", "/exit"])
     monkeypatch.setattr("builtins.input", lambda _: next(inputs))
     with patch("xolt.cli.XoltSession.attach", new_callable=AsyncMock, return_value=session):
-        await chat(argparse.Namespace(prompt=None, session_id=None, interactive=True))
+        await chat(
+            argparse.Namespace(prompt=None, session_id=None, interactive=True, raw_event=False)
+        )
 
     captured = capsys.readouterr()
     assert "Operator console ready." in captured.out
