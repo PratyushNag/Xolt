@@ -16,7 +16,16 @@ import webbrowser
 from pathlib import Path
 from typing import Any, cast
 
-from xolt import BackendProvisionError, MessageError, QuestionAskedError, XoltSession
+from xolt import (
+    BackendProvisionError,
+    MessageError,
+    QuestionAskedError,
+    TaskBlocker,
+    TaskEvent,
+    TaskHandle,
+    TaskResult,
+    XoltSession,
+)
 from xolt.backends.base import ExecutionBackend
 from xolt.runtimes.base import ManagedRuntime
 
@@ -37,6 +46,33 @@ Console commands:
   /exit                     Leave the console without deleting the sandbox
 
 Any non-command input is sent to the active chat session.
+"""
+
+COMPANION_HELP = """\
+Companion commands:
+  /help                     Show this help
+  /status                   Show current runtime metadata
+  /open                     Print the preview URL
+  /skills                   List installed skills
+  /add-skill <source>       Install a skill and reload the runtime
+  /skill add <source>       Add skill via shorthand (same as /add-skill)
+  /agents                   List deployed agents
+  /add-agent <name> <path>   Add an agent from a markdown prompt file
+  /agent add <name> <path>   Add agent via shorthand
+  /remove-agent <name>       Remove an agent
+  /agent remove <name>       Remove an agent via shorthand
+  /reload                   Reload the runtime
+  /files [path]              List files for a path
+  /tree [path]               Show a nested project tree
+  /cat <path>                Show file content
+  /find <query>              Find files by name
+  /grep <query>              Search file contents
+  /diff [session_id]         Show the latest diff for a chat session
+  /abort                     Abort current task
+  /raw-event                 Toggle raw event echo for this command
+  /exit                      Leave the companion loop without deleting the sandbox
+
+Any non-command input is submitted as a task.
 """
 
 
@@ -259,6 +295,93 @@ def _print_raw_event(event: dict[str, Any]) -> None:
         print(f"raw_event={event}")
 
 
+def _build_raw_event_from_task_event(event: TaskEvent) -> dict[str, Any]:
+    payload = dict(event.payload)
+    if event.type == "message_delta":
+        return {
+            "type": "message.part.delta",
+            "properties": {
+                "sessionID": event.chat_session_id,
+                "delta": payload.get("delta", ""),
+                "content": payload.get("delta", ""),
+            },
+        }
+    if event.type == "status":
+        return {
+            "type": "session.status",
+            "properties": {
+                "sessionID": event.chat_session_id,
+                "status": payload.get("status", "idle"),
+            },
+        }
+    if event.type == "file_changed":
+        return {
+            "type": "file.edited",
+            "properties": {
+                "sessionID": event.chat_session_id,
+                "file": payload.get("path", ""),
+                "op": payload.get("op", "change"),
+            },
+        }
+    if event.type == "question_asked":
+        return {
+            "type": "question.asked",
+            "properties": {
+                "id": payload.get("question_id", ""),
+                "sessionID": event.chat_session_id,
+                "questions": payload.get("questions", []),
+            },
+        }
+    return {
+        "type": "runtime.event",
+        "properties": {
+            "sessionID": event.chat_session_id,
+            "taskID": event.task_id,
+            "type": event.type,
+            "payload": payload,
+        },
+    }
+
+
+def _format_task_event(event: TaskEvent) -> None:
+    if event.type == "message_delta":
+        delta = event.payload.get("delta", "")
+        if isinstance(delta, str) and delta:
+            print(delta, end="", flush=True)
+        return
+    if event.type == "file_changed":
+        path = str(event.payload.get("path", "?")).strip()
+        op = str(event.payload.get("op", "change")).strip() or "change"
+        print(f"\n[file_changed] {op}: {path}")
+        return
+    if event.type == "question_asked":
+        raw = event.payload.get("questions", [])
+        print("\n[task.blocked] Runtime requested input.")
+        if isinstance(raw, list):
+            for idx, question in enumerate(raw, start=1):
+                print(f"[{idx}] {question}")
+        else:
+            print(raw)
+        return
+    if event.type == "status":
+        status = event.payload.get("status")
+        if status is not None:
+            print(f"\n[status] {status}")
+            return
+        print("\n[status] completed")
+        return
+    print(f"\n[runtime_event] {event.type}: {event.payload}")
+
+
+def _print_task_summary(result: TaskResult) -> None:
+    print(f"task.completed: {result.task_id}")
+    print(f"status: {result.status}")
+    if result.error:
+        print(f"error: {result.error}")
+    if result.response is not None:
+        print(f"response: {result.response}")
+
+
 def _print_chat_error(exc: BaseException) -> None:
     if isinstance(exc, TimeoutError):
         print(
@@ -279,6 +402,12 @@ def _print_chat_error(exc: BaseException) -> None:
         print(str(exc), file=sys.stderr)
         return
     print(f"Chat failed: {exc}", file=sys.stderr)
+
+
+def _print_blocker(blocker: TaskBlocker) -> None:
+    print("Task blocked. Runtime asked:")
+    for index, question in enumerate(blocker.questions, start=1):
+        print(f"{index}. {question}")
 
 
 async def create_session(args: argparse.Namespace) -> None:
@@ -454,6 +583,240 @@ async def _run_one_shot_chat(
     except (MessageError, QuestionAskedError, TimeoutError) as exc:
         _print_chat_error(exc)
         raise SystemExit(1) from exc
+
+
+async def _run_companion_task(
+    session: XoltSession,
+    prompt: str,
+    *,
+    chat_session_id: str,
+    raw_events: bool = False,
+) -> TaskHandle:
+    task = await session.submit_task(prompt, chat_session_id=chat_session_id)
+    print(f"task.started: {task.id}")
+    async for event in session.stream_task(task.id):
+        _format_task_event(event)
+        if raw_events:
+            _print_raw_event(_build_raw_event_from_task_event(event))
+    print()
+    return task
+
+
+async def _handle_companion_command(
+    session: XoltSession,
+    raw_command: str,
+    *,
+    state: dict[str, str],
+    active_chat_session_id: str | None,
+    active_task_id: str | None,
+    raw_events: bool = False,
+) -> tuple[bool, str | None, str | None, bool]:
+    parts = shlex.split(raw_command)
+    if not parts:
+        return False, active_chat_session_id, active_task_id, raw_events
+
+    command = parts[0]
+    if command in {"/help"}:
+        print(COMPANION_HELP.rstrip())
+        return False, active_chat_session_id, active_task_id, raw_events
+
+    if command in {"/exit", "/quit"}:
+        return True, active_chat_session_id, active_task_id, raw_events
+
+    if command == "/status":
+        preview_url = await session.preview_url()
+        state = dict(state)
+        if active_chat_session_id:
+            state["chat_session_id"] = active_chat_session_id
+        _print_status_summary(state=state, reachable=True, preview_url=preview_url)
+        return False, active_chat_session_id, active_task_id, raw_events
+
+    if command == "/open":
+        print(await session.preview_url())
+        return False, active_chat_session_id, active_task_id, raw_events
+
+    if command in {"/skill", "/add-skill"} and len(parts) >= 2:
+        source = parts[1] if command == "/add-skill" else (parts[2] if len(parts) >= 3 else "")
+        if not source:
+            print("Usage: /add-skill <source> | /skill add <source>", file=sys.stderr)
+            return False, active_chat_session_id, active_task_id, raw_events
+        installed, failed = await session.add_skills([source], reload=True)
+        print(f"Installed: {', '.join(installed) if installed else '(none)'}")
+        if failed:
+            print(f"Failed: {', '.join(failed)}", file=sys.stderr)
+        return False, active_chat_session_id, active_task_id, raw_events
+
+    if command == "/skills":
+        for skill in await session.list_skills():
+            print(skill)
+        return False, active_chat_session_id, active_task_id, raw_events
+
+    if command in {"/add-agent", "/agent", "/remove-agent"}:
+        if command == "/add-agent":
+            if len(parts) != 3:
+                print("Usage: /add-agent <name> <path>", file=sys.stderr)
+                return False, active_chat_session_id, active_task_id, raw_events
+            name, source_path = parts[1], parts[2]
+        elif command == "/remove-agent":
+            if len(parts) != 2:
+                print("Usage: /remove-agent <name>", file=sys.stderr)
+                return False, active_chat_session_id, active_task_id, raw_events
+            await session.remove_agent(parts[1], reload=True)
+            print(f"Removed agent: {parts[1]}")
+            return False, active_chat_session_id, active_task_id, raw_events
+        else:
+            if len(parts) < 3:
+                print(
+                    "Usage: /agent add <name> <path> | /agent remove <name>",
+                    file=sys.stderr,
+                )
+                return False, active_chat_session_id, active_task_id, raw_events
+            action = parts[1]
+            if action == "add":
+                if len(parts) != 4:
+                    print("Usage: /agent add <name> <path>", file=sys.stderr)
+                    return False, active_chat_session_id, active_task_id, raw_events
+                name, source_path = parts[2], parts[3]
+            elif action == "remove":
+                if len(parts) != 3:
+                    print("Usage: /agent remove <name>", file=sys.stderr)
+                    return False, active_chat_session_id, active_task_id, raw_events
+                await session.remove_agent(parts[2], reload=True)
+                print(f"Removed agent: {parts[2]}")
+                return False, active_chat_session_id, active_task_id, raw_events
+            else:
+                print("Usage: /agent add <name> <path> | /agent remove <name>", file=sys.stderr)
+                return False, active_chat_session_id, active_task_id, raw_events
+
+        prompt = Path(source_path).read_text(encoding="utf-8")
+        await session.add_agent(
+            name,
+            {
+                "description": f"User-defined Xolt agent ({name})",
+                "mode": "subagent",
+                "prompt": prompt,
+            },
+            reload=True,
+        )
+        print(f"Added agent: {name}")
+        return False, active_chat_session_id, active_task_id, raw_events
+
+    if command == "/reload":
+        await session.reload_runtime()
+        print("Runtime reloaded")
+        return False, active_chat_session_id, active_task_id, raw_events
+
+    if command == "/files":
+        file_path = parts[1] if len(parts) > 1 else None
+        _print_file_listing(await session.list_files(file_path))
+        return False, active_chat_session_id, active_task_id, raw_events
+
+    if command == "/tree":
+        tree_path = parts[1] if len(parts) > 1 else None
+        _print_tree(await session.get_file_tree(tree_path))
+        return False, active_chat_session_id, active_task_id, raw_events
+
+    if command == "/cat" and len(parts) >= 2:
+        content = await session.read_file(parts[1])
+        if isinstance(content, dict):
+            text = content.get("content")
+            if isinstance(text, str):
+                print(text)
+            else:
+                print(content)
+        else:
+            print(content)
+        return False, active_chat_session_id, active_task_id, raw_events
+
+    if command == "/find" and len(parts) >= 2:
+        for match in await session.find_files(parts[1]):
+            print(match)
+        return False, active_chat_session_id, active_task_id, raw_events
+
+    if command == "/grep" and len(parts) >= 2:
+        for match in await session.search_in_files(parts[1]):
+            print(match)
+        return False, active_chat_session_id, active_task_id, raw_events
+
+    if command == "/diff":
+        diff_session_id = parts[1] if len(parts) > 1 else active_chat_session_id
+        if not diff_session_id:
+            print(
+                "No chat session id is active yet. Send a prompt first or pass one explicitly.",
+                file=sys.stderr,
+            )
+            return False, active_chat_session_id, active_task_id, raw_events
+        _print_diff(await session.get_session_diff(diff_session_id))
+        return False, active_chat_session_id, active_task_id, raw_events
+
+    if command == "/abort":
+        if not active_task_id:
+            print("No active task to abort.")
+            return False, active_chat_session_id, active_task_id, raw_events
+        await session.cancel_task(active_task_id)
+        print(f"task.cancelled: {active_task_id}")
+        return False, active_chat_session_id, None, raw_events
+
+    if command == "/raw-event":
+        next_state = not raw_events
+        print(f"Raw task event output: {'enabled' if next_state else 'disabled'}")
+        return False, active_chat_session_id, active_task_id, next_state
+
+    print(f"Unknown companion command: {raw_command}")
+    print("Use /help to list supported companion commands.")
+    return False, active_chat_session_id, active_task_id, raw_events
+
+
+async def _resolve_companion_chat_session(
+    args: argparse.Namespace,
+    session: XoltSession,
+) -> str:
+    if args.chat_session_id:
+        update_state({"chat_session_id": args.chat_session_id})
+        return args.chat_session_id
+    state = load_state() or {}
+    existing = state.get("chat_session_id")
+    sandbox_id = state.get("sandbox_id")
+    if existing and session.backend.sandbox_id == sandbox_id:
+        return existing
+    created = await session.create_chat_session(title="Xolt CLI Companion Session")
+    chat_session_id = str(created.get("id", "")).strip()
+    if not chat_session_id:
+        raise SystemExit("Runtime created a chat session without an id.")
+    update_state({"chat_session_id": chat_session_id})
+    return chat_session_id
+
+
+async def _resume_blocked_task_loop(
+    session: XoltSession,
+    task: TaskHandle,
+    *,
+    raw_events: bool = False,
+    timeout: float = 900,
+) -> TaskResult:
+    current_task = task
+    while True:
+        result = await session.wait_task(current_task.id, timeout=timeout)
+        if result.status != "blocked":
+            return result
+        blocker = session.get_task_blocker(current_task.id)
+        if blocker is None:
+            return result
+        _print_blocker(blocker)
+        answer = input(f"answer for {current_task.id}> ").strip()
+        if not answer:
+            return result
+        if answer.lower() in {"/abort", "/cancel"}:
+            await session.cancel_task(current_task.id)
+            print(f"task.cancelled: {current_task.id}")
+            return TaskResult(
+                task_id=current_task.id,
+                chat_session_id=current_task.chat_session_id,
+                status="cancelled",
+            )
+        current_task = await session.resume_blocked_task(current_task.id, answer)
+        if raw_events:
+            print(f"task.resumed: {current_task.id}")
 
 
 async def _handle_console_command(
@@ -634,6 +997,106 @@ async def console_session(args: argparse.Namespace) -> None:
         await session.close()
 
 
+async def companion_session(args: argparse.Namespace) -> None:
+    (
+        state,
+        sandbox_id,
+        backend_name,
+        runtime_name,
+        session_id,
+        cmd_id,
+        chat_session_id,
+    ) = _resolve_session_metadata(args)
+    session = await _attach_resolved_session(
+        sandbox_id,
+        backend_name=backend_name,
+        runtime_name=runtime_name,
+        session_id=session_id,
+        cmd_id=cmd_id,
+    )
+    effective_state = dict(state or {})
+    effective_state.update(
+        {
+            "backend": backend_name,
+            "runtime": runtime_name,
+            "sandbox_id": sandbox_id,
+            "session_id": session_id,
+            "cmd_id": cmd_id,
+        }
+    )
+    if chat_session_id:
+        effective_state["chat_session_id"] = chat_session_id
+    active_task_id: str | None = None
+    raw_events = bool(getattr(args, "raw_event", False))
+
+    try:
+        preview_url = await session.preview_url()
+        print(f"Attached to sandbox {sandbox_id}")
+        print(f"Preview: {preview_url}")
+        print("Parent-platform companion ready. Type /help for commands. Type /exit to leave.")
+
+        active_chat_session_id = await _resolve_companion_chat_session(args, session)
+        effective_state["chat_session_id"] = active_chat_session_id
+
+        while True:
+            raw = input("xolt> ").strip()
+            if not raw:
+                continue
+
+            if raw.startswith("/"):
+                (
+                    should_exit,
+                    active_chat_session_id,
+                    active_task_id,
+                    raw_events,
+                ) = await _handle_companion_command(
+                    session,
+                    raw,
+                    state=effective_state,
+                    active_chat_session_id=active_chat_session_id,
+                    active_task_id=active_task_id,
+                    raw_events=raw_events,
+                )
+                if active_chat_session_id:
+                    effective_state["chat_session_id"] = active_chat_session_id
+                if should_exit:
+                    break
+                continue
+
+            task = await _run_companion_task(
+                session,
+                raw,
+                chat_session_id=active_chat_session_id,
+                raw_events=raw_events,
+            )
+            active_task_id = task.id
+            result = await _resolve_companion_result(
+                session,
+                task.id,
+                timeout=getattr(args, "timeout", 900),
+            )
+            if result.status == "blocked":
+                result = await _resume_blocked_task_loop(
+                    session,
+                    task,
+                    raw_events=raw_events,
+                    timeout=getattr(args, "timeout", 900),
+                )
+            _print_task_summary(result)
+            active_task_id = None
+    finally:
+        await session.close()
+
+
+async def _resolve_companion_result(
+    session: XoltSession,
+    task_id: str,
+    *,
+    timeout: float = 900,
+) -> TaskResult:
+    return await session.wait_task(task_id, timeout=timeout)
+
+
 async def chat(args: argparse.Namespace) -> None:
     if args.interactive or args.prompt is None:
         console_args = argparse.Namespace(
@@ -722,6 +1185,21 @@ def build_parser() -> argparse.ArgumentParser:
     console_parser.add_argument("--chat-session-id", default=None)
     console_parser.add_argument("--raw-event", action="store_true")
 
+    companion_parser = subparsers.add_parser(
+        "companion",
+        help="Parent-platform simulation loop.",
+    )
+    companion_parser.add_argument("sandbox_id", nargs="?")
+    companion_parser.add_argument("--backend", default=None)
+    companion_parser.add_argument("--runtime", default=None)
+    companion_parser.add_argument("--session-id", default="")
+    companion_parser.add_argument("--cmd-id", default="")
+    companion_parser.add_argument("--chat-session-id", default=None)
+    companion_parser.add_argument(
+        "--raw-event", "--raw-events", dest="raw_event", action="store_true"
+    )
+    companion_parser.add_argument("--timeout", type=float, default=900)
+
     status_parser = subparsers.add_parser("status", help="Show runtime metadata and reachability.")
     status_parser.add_argument("sandbox_id", nargs="?")
     status_parser.add_argument("--backend", default=None)
@@ -780,6 +1258,9 @@ async def run_async(args: argparse.Namespace) -> int:
         return 0
     if args.command in {"attach", "console"}:
         await console_session(args)
+        return 0
+    if args.command == "companion":
+        await companion_session(args)
         return 0
     if args.command == "status":
         await status_session(args)
