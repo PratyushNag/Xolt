@@ -259,7 +259,7 @@ async def test_chat_prompt_and_interactive_paths(
 ) -> None:
     write_state(monkeypatch, tmp_path)
     session = make_session()
-    with patch("xolt.cli.XoltSession.attach", new_callable=AsyncMock, return_value=session):
+    with patch("xolt.cli.with_saved_session", new_callable=AsyncMock, return_value=session):
         await chat(
             argparse.Namespace(prompt="hello", session_id=None, interactive=False, raw_event=False)
         )
@@ -268,7 +268,11 @@ async def test_chat_prompt_and_interactive_paths(
     state = load_state()
     assert state is not None
     assert state["chat_session_id"] == "chat-123"
-    session.send_message.assert_awaited_once_with("hello", session_id="chat-123")
+    session.send_message.assert_awaited_once_with(
+        "hello",
+        session_id="chat-123",
+        on_event=None,
+    )
 
     session = make_session()
     save_state(
@@ -283,7 +287,7 @@ async def test_chat_prompt_and_interactive_paths(
     )
     inputs = iter(["hello", "/files src", "/tree src", "/diff", "/exit"])
     monkeypatch.setattr("builtins.input", lambda _: next(inputs))
-    with patch("xolt.cli.XoltSession.attach", new_callable=AsyncMock, return_value=session):
+    with patch("xolt.cli._attach_resolved_session", new_callable=AsyncMock, return_value=session):
         await chat(
             argparse.Namespace(prompt=None, session_id=None, interactive=True, raw_event=False)
         )
@@ -469,7 +473,7 @@ async def test_companion_session_submits_and_streams_task(
     inputs = iter(["Inspect workspace", "/exit"])
     monkeypatch.setattr("builtins.input", lambda _: next(inputs))
 
-    with patch("xolt.cli.XoltSession.attach", new_callable=AsyncMock, return_value=session):
+    with patch("xolt.cli._attach_resolved_session", new_callable=AsyncMock, return_value=session):
         await companion_session(build_parser().parse_args(["companion"]))
 
     output = capsys.readouterr().out
@@ -506,29 +510,34 @@ async def test_companion_session_handles_blocked_task_and_resume(
             TaskResult(
                 task_id="task-2",
                 chat_session_id="chat-123",
+                status="blocked",
+                response=None,
+                error=None,
+            ),
+            TaskResult(
+                task_id="task-2",
+                chat_session_id="chat-123",
                 status="completed",
                 response="all good",
                 error=None,
             ),
         ]
     )
-    session.get_task_blocker = AsyncMock(
-        return_value=TaskBlocker(
-            task_id="task-2",
-            chat_session_id="chat-123",
-            question_id="q1",
-            questions=["What is the priority?"],
-            streamed_text="",
-            payload={},
-            seen_at=datetime(2026, 1, 2),
-        )
+    session.get_task_blocker = lambda *_args, **_kwargs: TaskBlocker(
+        task_id="task-2",
+        chat_session_id="chat-123",
+        question_id="q1",
+        questions=["What is the priority?"],
+        streamed_text="",
+        payload={},
+        seen_at=datetime(2026, 1, 2),
     )
     session.resume_blocked_task = AsyncMock(return_value=task)
 
     inputs = iter(["Need clarification", "high", "/exit"])
     monkeypatch.setattr("builtins.input", lambda _: next(inputs))
 
-    with patch("xolt.cli.XoltSession.attach", new_callable=AsyncMock, return_value=session):
+    with patch("xolt.cli._attach_resolved_session", new_callable=AsyncMock, return_value=session):
         await companion_session(build_parser().parse_args(["companion"]))
 
     captured = capsys.readouterr().out
