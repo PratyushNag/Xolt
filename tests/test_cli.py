@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from xolt import BackendProvisionError, QuestionAskedError
+from xolt import (
+    BackendProvisionError,
+    QuestionAskedError,
+    TaskBlocker,
+    TaskEvent,
+    TaskHandle,
+    TaskResult,
+)
 from xolt.cli import (
     add_agent,
     add_skills,
@@ -16,6 +24,7 @@ from xolt.cli import (
     build_runtime,
     chat,
     clear_state,
+    companion_session,
     console_session,
     create_session,
     default_backend_name,
@@ -36,6 +45,11 @@ from xolt.cli import (
     stop_session,
     with_saved_session,
 )
+
+
+async def _iter_task_events(events: list[TaskEvent]):
+    for event in events:
+        yield event
 
 
 def make_session() -> SimpleNamespace:
@@ -122,6 +136,8 @@ def test_parser_accepts_new_commands() -> None:
     assert parser.parse_args(["chat", "hello"]).command == "chat"
     assert parser.parse_args(["chat", "--interactive"]).interactive is True
     assert parser.parse_args(["chat", "hello", "--raw-event"]).raw_event is True
+    assert parser.parse_args(["companion", "--raw-events"]).raw_event is True
+    assert parser.parse_args(["companion", "--timeout", "42"]).timeout == 42.0
     assert parser.parse_args(["skills", "add", "a/b"]).skills_command == "add"
     assert parser.parse_args(["runtime", "reload"]).runtime_command == "reload"
     assert parser.parse_args(["agents", "list"]).agents_command == "list"
@@ -379,10 +395,138 @@ async def test_run_async_dispatches() -> None:
         assert await run_async(args) == 0
         fn.assert_awaited_once()
 
+    args = build_parser().parse_args(["companion"])
+    with patch("xolt.cli.companion_session", new_callable=AsyncMock) as fn:
+        assert await run_async(args) == 0
+        fn.assert_awaited_once()
+
     args = build_parser().parse_args(["doctor"])
     with patch("xolt.cli.doctor", return_value=0) as fn:
         assert await run_async(args) == 0
         fn.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_companion_session_submits_and_streams_task(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    write_state(monkeypatch, tmp_path)
+    session = make_session()
+    task = TaskHandle(
+        id="task-1",
+        chat_session_id="chat-123",
+        prompt="Inspect files",
+        created_at=datetime(2026, 1, 1),
+    )
+
+    async def _stream() -> None:
+        async for event in _iter_task_events(
+            [
+                TaskEvent(
+                    id="event-1",
+                    type="message_delta",
+                    ts=datetime(2026, 1, 1),
+                    worker_id="worker",
+                    chat_session_id="chat-123",
+                    task_id="task-1",
+                    sequence=1,
+                    payload={"delta": "hello"},
+                ),
+                TaskEvent(
+                    id="event-2",
+                    type="status",
+                    ts=datetime(2026, 1, 1),
+                    worker_id="worker",
+                    chat_session_id="chat-123",
+                    task_id="task-1",
+                    sequence=2,
+                    payload={"status": "idle"},
+                ),
+            ]
+        ):
+            yield event
+
+    session.submit_task = AsyncMock(return_value=task)
+    session.stream_task = lambda *_args, **_kwargs: _stream()
+    session.wait_task = AsyncMock(
+        return_value=TaskResult(
+            task_id="task-1",
+            chat_session_id="chat-123",
+            status="completed",
+            response="done",
+        )
+    )
+    inputs = iter(["Inspect workspace", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+
+    with patch("xolt.cli.XoltSession.attach", new_callable=AsyncMock, return_value=session):
+        await companion_session(build_parser().parse_args(["companion"]))
+
+    output = capsys.readouterr().out
+    assert "task.started: task-1" in output
+    assert "task.completed: task-1" in output
+    assert "status: completed" in output
+
+
+@pytest.mark.asyncio
+async def test_companion_session_handles_blocked_task_and_resume(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    write_state(monkeypatch, tmp_path)
+    session = make_session()
+    task = TaskHandle(
+        id="task-2",
+        chat_session_id="chat-123",
+        prompt="Need clarification",
+        created_at=datetime(2026, 1, 2),
+    )
+    session.submit_task = AsyncMock(return_value=task)
+    session.stream_task = lambda *_args, **_kwargs: _iter_task_events([])
+    session.wait_task = AsyncMock(
+        side_effect=[
+            TaskResult(
+                task_id="task-2",
+                chat_session_id="chat-123",
+                status="blocked",
+                response=None,
+                error=None,
+            ),
+            TaskResult(
+                task_id="task-2",
+                chat_session_id="chat-123",
+                status="completed",
+                response="all good",
+                error=None,
+            ),
+        ]
+    )
+    session.get_task_blocker = AsyncMock(
+        return_value=TaskBlocker(
+            task_id="task-2",
+            chat_session_id="chat-123",
+            question_id="q1",
+            questions=["What is the priority?"],
+            streamed_text="",
+            payload={},
+            seen_at=datetime(2026, 1, 2),
+        )
+    )
+    session.resume_blocked_task = AsyncMock(return_value=task)
+
+    inputs = iter(["Need clarification", "high", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+
+    with patch("xolt.cli.XoltSession.attach", new_callable=AsyncMock, return_value=session):
+        await companion_session(build_parser().parse_args(["companion"]))
+
+    captured = capsys.readouterr().out
+    assert "Task blocked. Runtime asked:" in captured
+    assert "1. What is the priority?" in captured
+    assert "task.completed: task-2" in captured
 
 
 def test_main_success_and_error_paths(monkeypatch: pytest.MonkeyPatch) -> None:
