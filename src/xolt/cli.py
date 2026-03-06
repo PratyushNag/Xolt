@@ -775,7 +775,7 @@ async def _handle_companion_command(
 async def _resolve_companion_chat_session(
     args: argparse.Namespace,
     session: XoltSession,
-) -> str | None:
+) -> str:
     if args.chat_session_id:
         resolved_chat_session_id: str = args.chat_session_id
         update_state({"chat_session_id": resolved_chat_session_id})
@@ -1043,7 +1043,8 @@ async def companion_session(args: argparse.Namespace) -> None:
         print("Parent-platform companion ready. Type /help for commands. Type /exit to leave.")
 
         active_chat_session_id: str | None = await _resolve_companion_chat_session(args, session)
-        effective_state["chat_session_id"] = active_chat_session_id
+        if active_chat_session_id is not None:
+            effective_state["chat_session_id"] = active_chat_session_id
 
         while True:
             raw = input("xolt> ").strip()
@@ -1073,7 +1074,8 @@ async def companion_session(args: argparse.Namespace) -> None:
             task = await _run_companion_task(
                 session,
                 raw,
-                chat_session_id=active_chat_session_id,
+                chat_session_id=active_chat_session_id
+                or await _resolve_companion_chat_session(args, session),
                 raw_events=raw_events,
             )
             active_task_id = task.id
