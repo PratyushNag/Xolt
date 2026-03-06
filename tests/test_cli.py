@@ -112,13 +112,16 @@ def test_build_backend_and_runtime_success() -> None:
 def test_parser_accepts_new_commands() -> None:
     parser = build_parser()
     assert parser.parse_args(["start"]).command == "start"
+    assert parser.parse_args(["attach", "--raw-event"]).raw_event is True
     assert parser.parse_args(["attach"]).command == "attach"
+    assert parser.parse_args(["console", "--raw-event"]).raw_event is True
     assert parser.parse_args(["console"]).command == "console"
     assert parser.parse_args(["status"]).command == "status"
     assert parser.parse_args(["open"]).command == "open"
     assert parser.parse_args(["stop"]).command == "stop"
     assert parser.parse_args(["chat", "hello"]).command == "chat"
     assert parser.parse_args(["chat", "--interactive"]).interactive is True
+    assert parser.parse_args(["chat", "hello", "--raw-event"]).raw_event is True
     assert parser.parse_args(["skills", "add", "a/b"]).skills_command == "add"
     assert parser.parse_args(["runtime", "reload"]).runtime_command == "reload"
     assert parser.parse_args(["agents", "list"]).agents_command == "list"
@@ -266,6 +269,36 @@ async def test_chat_prompt_and_interactive_paths(
     assert "reply" in captured.out
     assert "directory: src" in captured.out
     assert "edit: README.md" in captured.out
+
+
+@pytest.mark.asyncio
+async def test_chat_raw_events_enable_event_callback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    write_state(monkeypatch, tmp_path)
+    session = make_session()
+    with patch("xolt.cli.XoltSession.attach", new_callable=AsyncMock, return_value=session):
+        await chat(build_parser().parse_args(["chat", "hello", "--raw-event"]))
+    called_kwargs = session.send_message.await_args.kwargs
+    assert called_kwargs["on_event"] is not None
+
+
+@pytest.mark.asyncio
+async def test_console_raw_events_enable_event_callback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    write_state(monkeypatch, tmp_path)
+    session = make_session()
+    inputs = iter(["hello", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+
+    with patch("xolt.cli.XoltSession.attach", new_callable=AsyncMock, return_value=session):
+        await console_session(build_parser().parse_args(["attach", "--raw-event"]))
+
+    called_kwargs = session.send_message.await_args.kwargs
+    assert called_kwargs["on_event"] is not None
 
 
 @pytest.mark.asyncio

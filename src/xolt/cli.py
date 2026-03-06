@@ -252,6 +252,13 @@ def _print_diff(entries: list[dict[str, Any]]) -> None:
         print(f"{operation}: {path}")
 
 
+def _print_raw_event(event: dict[str, Any]) -> None:
+    try:
+        print(json.dumps(event, sort_keys=True))
+    except TypeError:
+        print(f"raw_event={event}")
+
+
 def _print_chat_error(exc: BaseException) -> None:
     if isinstance(exc, TimeoutError):
         print(
@@ -428,14 +435,22 @@ async def _run_one_shot_chat(
     *,
     sandbox_id: str,
     chat_session_id: str | None,
+    raw_events: bool = False,
 ) -> None:
+    event_printer = _print_raw_event if raw_events else None
     try:
         active_chat_session_id = await _ensure_chat_session(
             session,
             sandbox_id=sandbox_id,
             preferred_session_id=chat_session_id,
         )
-        print(await session.send_message(prompt, session_id=active_chat_session_id))
+        print(
+            await session.send_message(
+                prompt,
+                session_id=active_chat_session_id,
+                on_event=event_printer,
+            )
+        )
     except (MessageError, QuestionAskedError, TimeoutError) as exc:
         _print_chat_error(exc)
         raise SystemExit(1) from exc
@@ -599,13 +614,20 @@ async def console_session(args: argparse.Namespace) -> None:
                 continue
 
             try:
+                event_printer = _print_raw_event if args.raw_event else None
                 active_chat_session_id = await _ensure_chat_session(
                     session,
                     sandbox_id=sandbox_id,
                     preferred_session_id=active_chat_session_id,
                 )
                 effective_state["chat_session_id"] = active_chat_session_id
-                print(await session.send_message(raw, session_id=active_chat_session_id))
+                print(
+                    await session.send_message(
+                        raw,
+                        session_id=active_chat_session_id,
+                        on_event=event_printer,
+                    )
+                )
             except (MessageError, QuestionAskedError, TimeoutError) as exc:
                 _print_chat_error(exc)
     finally:
@@ -621,6 +643,7 @@ async def chat(args: argparse.Namespace) -> None:
             session_id="",
             cmd_id="",
             chat_session_id=args.session_id,
+            raw_event=args.raw_event,
         )
         await console_session(console_args)
         return
@@ -633,6 +656,7 @@ async def chat(args: argparse.Namespace) -> None:
             args.prompt,
             sandbox_id=state["sandbox_id"],
             chat_session_id=args.session_id or state.get("chat_session_id"),
+            raw_events=args.raw_event,
         )
     finally:
         await session.close()
@@ -684,6 +708,7 @@ def build_parser() -> argparse.ArgumentParser:
     attach_parser.add_argument("--session-id", default="")
     attach_parser.add_argument("--cmd-id", default="")
     attach_parser.add_argument("--chat-session-id", default=None)
+    attach_parser.add_argument("--raw-event", action="store_true")
 
     console_parser = subparsers.add_parser(
         "console",
@@ -695,6 +720,7 @@ def build_parser() -> argparse.ArgumentParser:
     console_parser.add_argument("--session-id", default="")
     console_parser.add_argument("--cmd-id", default="")
     console_parser.add_argument("--chat-session-id", default=None)
+    console_parser.add_argument("--raw-event", action="store_true")
 
     status_parser = subparsers.add_parser("status", help="Show runtime metadata and reachability.")
     status_parser.add_argument("sandbox_id", nargs="?")
@@ -719,6 +745,7 @@ def build_parser() -> argparse.ArgumentParser:
     chat_parser.add_argument("prompt", nargs="?")
     chat_parser.add_argument("--session-id", default=None)
     chat_parser.add_argument("--interactive", action="store_true")
+    chat_parser.add_argument("--raw-event", action="store_true")
 
     skills_parser = subparsers.add_parser("skills", help="Manage runtime skills.")
     skills_subparsers = skills_parser.add_subparsers(dest="skills_command", required=True)

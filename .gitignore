@@ -24,9 +24,6 @@ dist/
 htmlcov/
 uv.lock.bak
 
-# Legacy local caches
-src/opencode_daytona/__pycache__/
-
 # Local config
 .env
 
